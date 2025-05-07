@@ -188,10 +188,11 @@ def load_kube_config(*, project: str, zone: str, cluster: str):
             os.remove(auth_cache)
     except FileNotFoundError:
         logging.warning("Failed to remove %s, attempting to ignore.", auth_cache)
-
-    region = zone.rsplit("-", 1)[0]
+    ##Commnet out for testing!
+    # region = zone.rsplit("-", 1)[0]
     try:
-        k8s.config.load_kube_config(context=f"gke_{project}_{region}_{cluster}")
+        # k8s.config.load_kube_config(context=f"gke_{project}_{region}_{cluster}")
+        k8s.config.load_kube_config(context=f"gke_{project}_{zone}_{cluster}")
     except k8s.config.config_exception.ConfigException as e:
         get_credentials_cmd = (
             f"gcloud container clusters get-credentials {cluster} "
@@ -204,7 +205,8 @@ def load_kube_config(*, project: str, zone: str, cluster: str):
         if running_from_k8s() or running_from_vm():
             # Use --internal-ip to access internal cluster endpoint.
             subprocess_run(f"{get_credentials_cmd} --internal-ip", check=True)
-            k8s.config.load_kube_config(context=f"gke_{project}_{region}_{cluster}")
+            # k8s.config.load_kube_config(context=f"gke_{project}_{region}_{cluster}")
+            k8s.config.load_kube_config(context=f"gke_{project}_{zone}_{cluster}")
         else:
             raise app.UsageError(
                 f"Failed to load kube-config for cluster {cluster} with: {e}\n"
