@@ -196,7 +196,7 @@ def load_kube_config(*, project: str, zone: str, cluster: str):
         get_credentials_cmd = (
             f"gcloud container clusters get-credentials {cluster} "
             # f"--region {region} "
-            f"--location {zone}"
+            f"--location {zone} "
             f"--project {project}"
         )
         ## Edit the region flag into zone for debugging
