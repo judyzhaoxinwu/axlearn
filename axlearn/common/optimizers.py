@@ -163,9 +163,9 @@ def copy_partition(
             dtype=spec.dtype,
             shape=spec.shape,
             mesh_axes=spec.mesh_axes,
-            memory_kind=memory_kind
-            if pattern and re.fullmatch(pattern, path)
-            else spec.memory_kind,
+            memory_kind=(
+                memory_kind if pattern and re.fullmatch(pattern, path) else spec.memory_kind
+            ),
         ),
         tree_paths(specs),
         specs,
@@ -2104,9 +2104,11 @@ def offload_optimizer(
         # memory usage of all states. Moreover, when the optimizer is run, all activations are
         # released, so we have less memory pressure at that point in time.
         return jax.tree.map(
-            lambda path, tensor: jax.device_put(tensor, TransferToMemoryKind(dst))
-            if re.fullmatch(pattern, path)
-            else tensor,
+            lambda path, tensor: (
+                jax.device_put(tensor, TransferToMemoryKind(dst))
+                if re.fullmatch(pattern, path)
+                else tensor
+            ),
             tree_paths(state),
             state,
         )

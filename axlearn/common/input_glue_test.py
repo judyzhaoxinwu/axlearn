@@ -49,7 +49,7 @@ class InputGlueForRobertaTest(parameterized.TestCase, tf.test.TestCase):
     ):
         def noop_normalizer(
             # pylint: disable-next=unused-argument
-            input_key: Union[str, tuple[str, str]]
+            input_key: Union[str, tuple[str, str]],
         ) -> input_tf_data.DatasetToDatasetFn:
             return lambda ds: ds
 

@@ -195,9 +195,11 @@ def load_kube_config(*, project: str, zone: str, cluster: str):
     except k8s.config.config_exception.ConfigException as e:
         get_credentials_cmd = (
             f"gcloud container clusters get-credentials {cluster} "
-            f"--region {region} "
+            # f"--region {region} "
+            f"--location {zone}"
             f"--project {project}"
         )
+        ## Edit the region flag into zone for debugging
         # Automatically generate the kube-config on pod or VM.
         if running_from_k8s() or running_from_vm():
             # Use --internal-ip to access internal cluster endpoint.

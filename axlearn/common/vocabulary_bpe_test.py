@@ -36,7 +36,7 @@ TEXTS = [
     " \x85\x85- ",
     "hello world",
     "  this\r  \t\t a\ntest's  11'm'll  \tx  ",
-    "ah\u535A\u63A8zz",
+    "ah\u535a\u63a8zz",
     " \tHeLLo!how  \n Are yoU?  ",
     "from bert: John Johanson's house",
     # Note: this is slightly different from other occurrences, as it doesn't include the null

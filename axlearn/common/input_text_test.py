@@ -314,7 +314,7 @@ class AddTokenTypeIDTest(test_utils.TestCase):
 
             def trim_and_pad_batch():
                 def example_fn(
-                    example: dict[str, Union[tf.Tensor, tf.RaggedTensor]]
+                    example: dict[str, Union[tf.Tensor, tf.RaggedTensor]],
                 ) -> dict[str, tf.Tensor]:
                     # pytype: disable=attribute-error
                     for k, v in feature_lengths.items():
@@ -546,7 +546,7 @@ class TestTextNormalize(parameterized.TestCase, tf.test.TestCase):
         texts = [
             # Huggingface BasicTokenizer test queries:
             # https://github.com/huggingface/transformers/blob/31ec2cb2badfbdd4c1ac9c6c9b8a74e974984206/tests/bert/test_tokenization_bert.py#L121-L184
-            "ah\u535A\u63A8zz",
+            "ah\u535a\u63a8zz",
             " \tHeLLo!how  \n Are yoU?  ",
             # Custom tests.
             "from bert: John Johanson's house",
@@ -580,7 +580,7 @@ class TestTextNormalize(parameterized.TestCase, tf.test.TestCase):
         ),
     )
     def test_normalize(self, normalizer: InstantiableConfig, expected: list[str]):
-        texts = ["ah\u535A\u63A8zz \tHeLLo!how  \n Are yoU?  "]
+        texts = ["ah\u535a\u63a8zz \tHeLLo!how  \n Are yoU?  "]
         ds_fn = make_ds_fn(False, texts, repeat=1)
         process_fn = normalizer.set(input_key="text").instantiate()
         processed_ds = process_fn(ds_fn())
@@ -624,7 +624,7 @@ class TestTextNormalize(parameterized.TestCase, tf.test.TestCase):
         texts = [
             {
                 "text": [
-                    ["ah\u535A\u63A8zz \tHeLLo!how  \n Are yoU?  "],
+                    ["ah\u535a\u63a8zz \tHeLLo!how  \n Are yoU?  "],
                     ["I am good  <3", "What about you?!"],
                 ]
             }

@@ -1162,7 +1162,7 @@ def per_param_dtype_by_path(
     """
 
     def fn(
-        tree: Union[Nested[Tensor], Nested[TensorSpec]]
+        tree: Union[Nested[Tensor], Nested[TensorSpec]],
     ) -> Union[Nested[Tensor], Nested[TensorSpec]]:
         if update_rules is None:
             return jax.tree.map(lambda x: default_dtype, tree_paths(tree))
@@ -1217,7 +1217,7 @@ def cast_floats_per_param(
 
 
 def canonicalize_per_param_dtype(
-    param_dtype: Union[jnp.dtype, ConfigOr[PerParamFn[jnp.dtype]]]
+    param_dtype: Union[jnp.dtype, ConfigOr[PerParamFn[jnp.dtype]]],
 ) -> ConfigOr[PerParamFn[jnp.dtype]]:
     """Canonicalize the input `param_dtype` to a consistent format of
     `ConfigOr[PerParamFn[jnp.dtype]]`, which handles three possible cases:

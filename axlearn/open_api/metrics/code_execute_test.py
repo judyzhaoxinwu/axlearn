@@ -1,8 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 # pylint: disable=protected-access
-"""Unit test for code_execute.py.
-"""
+"""Unit test for code_execute.py."""
 import unittest
 from io import BytesIO
 from unittest.mock import MagicMock, patch

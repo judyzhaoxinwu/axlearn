@@ -105,9 +105,9 @@ class DecodingTest(TestCase):
         self.assertTrue(is_supported)
 
         o = fn(q, k, v, bias)
-        with jax.default_matmul_precision(
-            "highest"
-        ) if input_dtype is jnp.float32 else nullcontext():
+        with (
+            jax.default_matmul_precision("highest") if input_dtype is jnp.float32 else nullcontext()
+        ):
             o_ref = ReferenceMHA.default_config().set(**cfg).instantiate()(q, k, v, bias)
         if input_dtype is jnp.float32:
             if jax.default_backend() == "cpu":

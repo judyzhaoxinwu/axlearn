@@ -660,9 +660,11 @@ class CheckpointerTest(test_utils.TestCase):
         # pylint: disable=line-too-long
         with (
             _mesh(mesh_shape),
-            mock.patch("axlearn.common.file_system.listdir", patch_tf_io_behavior)
-            if listdir_add_trailing_slash
-            else nullcontext(),
+            (
+                mock.patch("axlearn.common.file_system.listdir", patch_tf_io_behavior)
+                if listdir_add_trailing_slash
+                else nullcontext()
+            ),
             tempfile.TemporaryDirectory() as temp_dir,
         ):
             cfg = Checkpointer.default_config().set(
