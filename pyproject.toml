@@ -14,6 +14,7 @@ requires-python = ">=3.10"
 dependencies = [
     "attrs>=23.1.0", # We use `type` in `attrs.field`
     "numpy==1.26.4",  # verified with tensorflow 2.14 RaggedTensor
+    "axlearn",
 ]
 
 [project.optional-dependencies]
@@ -107,6 +108,7 @@ gcp = [
 # Note: Specify -f https://storage.googleapis.com/jax-releases/libtpu_releases.html during install.
 tpu = [
     "axlearn[gcp]",
+    "axlearn[tpu]",
     "jax[tpu]==0.4.38",  # must be >=0.4.19 for compat with v5p.
 ]
 # Vertex AI tensorboard. TODO(markblee): Merge with `gcp`.
