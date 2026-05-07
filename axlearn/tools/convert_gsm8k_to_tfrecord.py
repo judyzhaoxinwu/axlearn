@@ -33,7 +33,7 @@ flags.DEFINE_integer(
 )
 
 
-def serialize_sample(question: str, answer: str) -> bytes:
+def serialize_sample(question: str, answer: str, annotation: str, short_answer: str) -> bytes:
     """Packs problem strings variables into serializable Protobuf features."""
     example = tf.train.Example(
         features=tf.train.Features(
@@ -43,6 +43,12 @@ def serialize_sample(question: str, answer: str) -> bytes:
                 ),
                 "answer": tf.train.Feature(
                     bytes_list=tf.train.BytesList(value=[answer.encode("utf-8")])
+                ),
+                "annotation": tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[annotation.encode("utf-8")])
+                ),
+                "short_answer": tf.train.Feature(
+                    bytes_list=tf.train.BytesList(value=[short_answer.encode("utf-8")])
                 ),
             }
         )
@@ -67,8 +73,12 @@ def convert_dataset(split: str, version_dir: str, num_shards: int) -> int:
     try:
         for item in data_stream.as_numpy_iterator():
             binary_record = serialize_sample(
-                question=item["question"].decode("utf-8"), answer=item["answer"].decode("utf-8")
+                question=item["question"].decode("utf-8"),
+                answer=item["answer"].decode("utf-8"),
+                annotation=item["annotation"].decode("utf-8"),
+                short_answer=item["short_answer"].decode("utf-8"),
             )
+
             assigned_shard = count % num_shards
             shard_writers[assigned_shard].write(binary_record)
             count += 1
@@ -118,6 +128,8 @@ def create_metadata_files(version_dir: str, num_shards: int, counts: dict):
                 "features": {
                     "question": {"type": "TENSOR", "tensor": {"shape": [], "dtype": "STRING"}},
                     "answer": {"type": "TENSOR", "tensor": {"shape": [], "dtype": "STRING"}},
+                    "annotation": {"type": "TENSOR", "tensor": {"shape": [], "dtype": "STRING"}},
+                    "short_answer": {"type": "TENSOR", "tensor": {"shape": [], "dtype": "STRING"}},
                 }
             },
         }
@@ -132,6 +144,8 @@ def verify_and_print_records(tfrecord_path: str, num_records: int):
     feature_description = {
         "question": tf.io.FixedLenFeature([], tf.string),
         "answer": tf.io.FixedLenFeature([], tf.string),
+        "annotation": tf.io.FixedLenFeature([], tf.string),
+        "short_answer": tf.io.FixedLenFeature([], tf.string),
     }
 
     build_dataset_fn = input_tf_data.tfrecord_dataset(
@@ -148,11 +162,15 @@ def verify_and_print_records(tfrecord_path: str, num_records: int):
         count += 1
         q_text = record["question"].numpy().decode("utf-8")
         a_text = record["answer"].numpy().decode("utf-8")
+        ann_text = record["annotation"].numpy().decode("utf-8")
+        sa_text = record["short_answer"].numpy().decode("utf-8")
 
-        print(f"\n[Record #{count}]")
-        print(f"Question:\n{q_text}")
-        print(f"Answer:\n{a_text}")
-        print("-" * 40)
+        logging.info("[eshenlog] [Record #%d]", count)
+        logging.info("[eshenlog] Question: %s", q_text)
+        logging.info("[eshenlog] Answer: %s", a_text)
+        logging.info("[eshenlog] Annotation: %s", ann_text)
+        logging.info("[eshenlog] Short Answer: %s", sa_text)
+        logging.info("[eshenlog] %s", "-" * 40)
 
 
 def main(_):

@@ -2,10 +2,12 @@
 
 """AXLearn SpmdTrainer orchestrating generation steps on twin models natively."""
 
+import re
 from typing import Dict, Tuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 from axlearn.common import utils
 from axlearn.common.config import config_class
@@ -125,15 +127,49 @@ class GrpoSpmdTrainer(SpmdTrainer):
                 full_sequences[:, 1:] != pad_id
             )
 
-            # Run mock evaluation scoring strategy
-            mock_rewards = jnp.ones((flat_completions.shape[0],))
+            # 4. JAX-Safe GSM8K Reward Evaluation via Host CPU Callbacks
+            # Since JIT cannot compile string operations, we execute parsing on
+            # Host CPU via jax.pure_callback!
+            def _parse_gsm8k_number(text: str) -> str:
+                # Extracts the final numeric answer usually located after '####'
+                # or at the end of text.
+                text = text.split("####")[-1].strip() if "####" in text else text
+                match = re.findall(r"[-+]?\d*\.\d+|\d+", text)
+                return match[-1] if match else ""
+
+            def score_gsm8k_rollouts_python(completions_np, targets_np):
+                # Executed strictly on Host CPU using regular Python string operations!
+                # Retrieve vocabulary from model
+                vocab = self.model.actor.vocab
+                rewards_list = []
+                for comp_ids, gt_ids in zip(completions_np, targets_np):
+                    # Convert JAX tokens back to Python strings
+                    comp_str = vocab.id_to_string(comp_ids.tolist())
+                    gt_str = vocab.id_to_string(gt_ids.tolist())
+
+                    extracted_gen = _parse_gsm8k_number(comp_str)
+                    extracted_gt = _parse_gsm8k_number(gt_str)
+
+                    rewards_list.append(
+                        1.0 if extracted_gen == extracted_gt and extracted_gen != "" else 0.0
+                    )
+                return np.array(rewards_list, dtype=np.float32)
+
+            # Invoke Python string parser on Host CPU dynamically from the compiled TPU graph!
+            real_rewards = jax.pure_callback(
+                score_gsm8k_rollouts_python,
+                jax.ShapeDtypeStruct((flat_completions.shape[0],), jnp.float32),
+                flat_completions,
+                full_sequences[:, 1:],
+                vjp_method="none",  # Rewards are non-differentiable (zero gradients internally)
+            )
 
             # Determine surrogate gradients objectives
             learner_outputs = self.learner.grpo_loss(
                 actor_logps=actor_seq_logps,
                 old_logps=actor_seq_logps,
                 ref_logps=ref_seq_logps,
-                advantages=self.learner.compute_advantages(mock_rewards),
+                advantages=self.learner.compute_advantages(real_rewards),
                 completion_mask=completion_mask,
             )
 
