@@ -4,6 +4,7 @@
 
 from typing import Dict, Optional
 
+import jax
 import jax.numpy as jnp
 import tensorflow as tf
 from absl import logging
@@ -155,7 +156,10 @@ class GRPOStateBuilder(Builder):
         flat_model = flat_state.trainer_state.model
 
         # 3. Manually replicate the restored parameters into both Actor and Reference policy sub-trees recursively!
-        actor_ref_model = {"actor": flat_model, "reference": flat_model}
+        # Physically copy/clone the Reference parameters PyTree using jax.tree.map(jnp.copy)
+        # to create independent device buffers and prevent JAX double-donation crashes!
+        cloned_reference_model = jax.tree.map(jnp.copy, flat_model)
+        actor_ref_model = {"actor": flat_model, "reference": cloned_reference_model}
 
         # 4. Rebuild the fully populated JAX TrainerState PyTree seamlessly
         updated_trainer_state = state.trainer_state._replace(model=actor_ref_model)
@@ -186,14 +190,13 @@ def trainer_configs(
             logging.warning("[eshenlog] Pre-training dataset verification skipped or failed: %s", e)
 
         fuji_kwargs = fuji.get_trainer_kwargs(
-            model_size, vocab_size=vocab_size, version=version, flash_attention=True
+            model_size, vocab_size=vocab_size, version=version, flash_attention=False
         )
 
         fuji_model_cfg = fuji_kwargs["model_cfg"]
         max_sequence_length = fuji_kwargs["max_sequence_length"]
 
         logging.info("[eshenlog] Instantiating GrpoModel with jnp.bfloat16 dtype to prevent OOM...")
-
         grpo_model_cfg = GrpoModel.default_config().set(
             name="model",  # Explicitly set name to satisfy config requirements
             dtype=jnp.bfloat16,  # Explicitly set dtype to bfloat16 to reduce memory consumption by 50% and prevent OOM!
@@ -215,9 +218,14 @@ def trainer_configs(
         trainer_cfg = GrpoSpmdTrainer.default_config().set(
             name="grpo_trainer",  # Explicitly set name to satisfy config requirements
             model=grpo_model_cfg,
+            vocab=_vocab_cfg(
+                vocab_size
+            ),  # <--- Passes the sentencepiece vocabulary directly to the trainer!
+            num_generations=2,  # <--- Sets Trainer group size to 2 as well!
+            max_step=1000,  # <--- Limits training to exactly 1000 SFT/RL steps!
             learner=AxlearnGrpoLearner.default_config().set(
                 name="learner",  # Explicitly set name to satisfy config requirements
-                num_generations=4,
+                num_generations=2,  # <--- Sets Learner group size to 2!
                 beta=0.04,
                 optimizer=optimizer_cfg,  # <--- Satisfies required optimizer parameters!
             ),
@@ -254,7 +262,7 @@ def trainer_configs(
 
         # Connect with native storage structures Input pipeline (using the complete, canonical AXLearn SpmdInput configuration)
         train_dispatcher_cfg = SpmdInputDispatcher.default_config().set(
-            global_logical_batch_size=1024,  # Safe standard trainer batch size
+            global_logical_batch_size=128,  # <--- Reduced from 1024 to 128 to drop the memory footprint per chip!
             partition_spec=PartitionSpec(("data", "expert", "fsdp")),
         )
 
@@ -276,6 +284,36 @@ def trainer_configs(
                 }
             ),
         )
+
+        # 1. Configure PartitionSpecModifier to shard the LM Head and Token Embeddings for both policies!
+        from axlearn.common.trainer_config_modifier import PartitionSpecModifier
+
+        sharding_modifier = (
+            PartitionSpecModifier.default_config()
+            .set(
+                partition_specs={
+                    # Actor layers sharding overrides
+                    "model.actor.decoder.lm_head": {
+                        "param_partition_spec": ("model", ("expert", "fsdp", "seq"))
+                    },
+                    "model.actor.decoder.emb.token_emb": {
+                        "param_partition_spec": ("model", ("expert", "fsdp", "seq"))
+                    },
+                    # Reference layers sharding overrides
+                    "model.reference.decoder.lm_head": {
+                        "param_partition_spec": ("model", ("expert", "fsdp", "seq"))
+                    },
+                    "model.reference.decoder.emb.token_emb": {
+                        "param_partition_spec": ("model", ("expert", "fsdp", "seq"))
+                    },
+                }
+            )
+            .instantiate()
+        )
+
+        # 2. Mutate and apply sharding overrides directly to the trainer configuration!
+        trainer_cfg = sharding_modifier(trainer_cfg)
+
         return trainer_cfg
 
     config_key = f"grpo-fuji-{model_size}-v1"

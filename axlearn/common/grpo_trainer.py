@@ -10,9 +10,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from axlearn.common import utils
-from axlearn.common.config import config_class
-from axlearn.common.module import child_context
+from axlearn.common.config import REQUIRED, InstantiableConfig, Required, config_class
+from axlearn.common.module import Module, child_context
 from axlearn.common.module import functional as F
+from axlearn.common.module import new_output_collection
 from axlearn.common.trainer import SpmdTrainer, TrainerState
 from axlearn.common.update_transformation import ForwardOutputs
 from axlearn.common.utils import NestedTensor, Tensor
@@ -26,6 +27,12 @@ class GrpoSpmdTrainer(SpmdTrainer):
         """Configures GrpoSpmdTrainer."""
 
         num_generations: int = 4
+        vocab: Required[InstantiableConfig] = REQUIRED  # SentencePiece vocabulary configuration!
+
+    def __init__(self, cfg: Config, *, parent: Module):
+        super().__init__(cfg, parent=parent)
+        # Instantiate the configured vocabulary directly at startup!
+        self._vocab = cfg.vocab.instantiate()
 
     def _train_step(
         self,
@@ -51,11 +58,12 @@ class GrpoSpmdTrainer(SpmdTrainer):
             ref_params = params["reference"]
 
             prompt_prefix = inputs["input_batch"]["prefix"]
-            num_generations = inputs.get("num_generations", 4)
+            num_generations = self.learner.config.num_generations
             pad_id = inputs.get("pad_id", 0)
 
             # 1. Generate trajectories via active Actor model
-            model_output_collection = F.new_output_collection()
+            model_output_collection = new_output_collection()
+
             with child_context(
                 "model/actor",
                 module=self.model.actor,
@@ -98,7 +106,8 @@ class GrpoSpmdTrainer(SpmdTrainer):
                 actor_results = self.model.actor.predict(eval_input)
 
             # Process Reference results
-            ref_output_collection = F.new_output_collection()
+            ref_output_collection = new_output_collection()
+
             with child_context(
                 "model/reference",
                 module=self.model.reference,
@@ -139,13 +148,14 @@ class GrpoSpmdTrainer(SpmdTrainer):
 
             def score_gsm8k_rollouts_python(completions_np, targets_np):
                 # Executed strictly on Host CPU using regular Python string operations!
-                # Retrieve vocabulary from model
-                vocab = self.model.actor.vocab
+                # Retrieve vocabulary directly from the trainer's instantiated vocab!
+                vocab = self._vocab
+
                 rewards_list = []
                 for comp_ids, gt_ids in zip(completions_np, targets_np):
                     # Convert JAX tokens back to Python strings
-                    comp_str = vocab.id_to_string(comp_ids.tolist())
-                    gt_str = vocab.id_to_string(gt_ids.tolist())
+                    comp_str = vocab.decode(comp_ids.tolist())
+                    gt_str = vocab.decode(gt_ids.tolist())
 
                     extracted_gen = _parse_gsm8k_number(comp_str)
                     extracted_gt = _parse_gsm8k_number(gt_str)
@@ -156,13 +166,15 @@ class GrpoSpmdTrainer(SpmdTrainer):
                 return np.array(rewards_list, dtype=np.float32)
 
             # Invoke Python string parser on Host CPU dynamically from the compiled TPU graph!
-            real_rewards = jax.pure_callback(
+            raw_rewards = jax.pure_callback(
                 score_gsm8k_rollouts_python,
                 jax.ShapeDtypeStruct((flat_completions.shape[0],), jnp.float32),
                 flat_completions,
                 full_sequences[:, 1:],
-                vjp_method="none",  # Rewards are non-differentiable (zero gradients internally)
             )
+
+            # Wrap in stop_gradient to indicate rewards are non-differentiable (zero gradients)
+            real_rewards = jax.lax.stop_gradient(raw_rewards)
 
             # Determine surrogate gradients objectives
             learner_outputs = self.learner.grpo_loss(
@@ -180,7 +192,7 @@ class GrpoSpmdTrainer(SpmdTrainer):
 
         opt_params = self._opt_params(state.model)
 
-        fwd_bwd_outputs, learner_output_collection = F.functional_call(
+        fwd_bwd_outputs, learner_output_collection = F(
             self.learner,
             method="forward_and_backward",
             state=state.learner,
