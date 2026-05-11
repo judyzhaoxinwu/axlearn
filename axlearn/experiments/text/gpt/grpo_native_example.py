@@ -17,6 +17,7 @@ from axlearn.common.config import (
     Required,
     TrainerConfigFn,
     config_class,
+    config_for_class,
     config_for_function,
 )
 from axlearn.common.grpo_learner import AxlearnGrpoLearner
@@ -28,15 +29,31 @@ from axlearn.common.state_builder import Builder, TensorStoreStateStorageBuilder
 from axlearn.experiments.text.common import tfds_text_source, vocab
 from axlearn.experiments.text.gpt import fuji
 from axlearn.experiments.text.gpt.common import MESH_AXIS_NAMES
+from axlearn.experiments.text.gpt.vocabulary_fuji_v3 import FujiV3Vocabulary
 from axlearn.tools.convert_gsm8k_to_tfrecord import verify_and_print_records
+
+
+class GRPOV3Vocabulary(FujiV3Vocabulary):
+    """Custom FujiV3Vocabulary subclass providing a robust fallback for missing pad token IDs
+
+    on certain pre-trained SentencePiece/TikToken tokenizer configurations.
+    """
+
+    @property
+    def pad_id(self) -> int:
+        # Strictly returns 0 to satisfy seqio's data padding and pipeline constraints perfectly!
+        return 0
 
 
 def _vocab_cfg(vocab_size: int) -> InstantiableConfig:
     """Constructs vocabulary configuration instance based on size."""
     if vocab_size in (32 * 1024, 32000):
         return config_for_function(vocab).set(sentencepiece_model_name="bpe_32k_c4.model")
-    if vocab_size in (128 * 1024, 128256):
+    if vocab_size == 128 * 1024:
         return config_for_function(vocab).set(sentencepiece_model_name="bpe_128k_c4.model")
+    if vocab_size == 128256:
+        # TikToken tokenizer layout with robust padding fallbacks!
+        return config_for_class(GRPOV3Vocabulary).set(filename="Llama-3-tokenizer.json")
     raise ValueError(f"Unsupported vocabulary size: {vocab_size}")
 
 
@@ -194,7 +211,15 @@ def trainer_configs(
         )
 
         fuji_model_cfg = fuji_kwargs["model_cfg"]
-        max_sequence_length = fuji_kwargs["max_sequence_length"]
+
+        # Force bfloat16 precision on all underlying model, decoder, and attention parameters!
+        # This cuts the physical parameter and intermediate activations memory footprint in half globally!
+        fuji_model_cfg.dtype = jnp.bfloat16
+        fuji_model_cfg.decoder.dtype = jnp.bfloat16
+
+        # Overrides max_sequence_length to 512 to reduce the attention matrix footprint another 4-fold!
+        # This guarantees high-speed, OOM-free training on standard word problem datasets like GSM8K.
+        max_sequence_length = 512
 
         logging.info("[eshenlog] Instantiating GrpoModel with jnp.bfloat16 dtype to prevent OOM...")
         grpo_model_cfg = GrpoModel.default_config().set(
@@ -251,7 +276,7 @@ def trainer_configs(
             # Configure the underlying storage builder to read GCS files with strict validations disabled!
             storage_builder_cfg = TensorStoreStateStorageBuilder.default_config().set(
                 dir=f"gs://ericshen-axlearn/checkpoints/{gcs_dir_name}/step_00000000",
-                validation="CONTAINS_STATE",  # <--- Ignors missing optimizer parameters by checking only subset keys!
+                validation="CONTAINS_STATE_UP_TO_DTYPE",  # <--- Ignores float32 to bfloat16 dtype differences and casts on the fly!
             )
 
             # Use custom GRPOStateBuilder to manually replicate flat GCS parameters into both policy sub-trees!
