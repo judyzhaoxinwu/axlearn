@@ -291,10 +291,15 @@ class GrpoSpmdTrainer(SpmdTrainer):
             # Wrap in stop_gradient to indicate rewards are non-differentiable (zero gradients)
             real_rewards = jax.lax.stop_gradient(raw_rewards)
 
+            # Freeze the actor's current log probabilities to act as the old policy baseline.
+            # This ensures the PPO importance ratio is differentiable ONLY with respect to the new actor_logps!
+            # Without this, JAX would differentiate through both numerator and denominator, mathematically zeroing out the gradients!
+            old_seq_logps = jax.lax.stop_gradient(actor_seq_logps)
+
             # Determine surrogate gradients objectives
             learner_outputs = self.learner.grpo_loss(
                 actor_logps=actor_seq_logps,
-                old_logps=actor_seq_logps,
+                old_logps=old_seq_logps,
                 ref_logps=ref_seq_logps,
                 advantages=self.learner.compute_advantages(real_rewards),
                 completion_mask=completion_mask,

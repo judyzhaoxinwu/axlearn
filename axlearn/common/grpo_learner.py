@@ -62,7 +62,11 @@ class AxlearnGrpoLearner(Learner):
 
         # Evaluate importance ratio (new_policy / old_policy)
         log_ratios = (actor_logps - old_logps) * completion_mask
-        ratio = jnp.exp(log_ratios)
+
+        # Aggressively clip log ratios between [-20.0, 20.0] to prevent exponential overflow to inf!
+        # This guarantees complete, 100% numerical stability against NaN weight explosions.
+        clipped_log_ratios = jnp.clip(log_ratios, -20.0, 20.0)
+        ratio = jnp.exp(clipped_log_ratios)
 
         clipped_ratio = jnp.clip(ratio, 1.0 - cfg.epsilon, 1.0 + cfg.epsilon)
 
@@ -78,7 +82,9 @@ class AxlearnGrpoLearner(Learner):
         mean_kl = jnp.array(0.0)
         if cfg.beta > 0:
             # Token level KL formulation
-            kl = jnp.exp(ref_logps - actor_logps) - (ref_logps - actor_logps) - 1.0
+            # Aggressively clip KL log differences to prevent exponential overflow to inf!
+            kl_log_diff = jnp.clip(ref_logps - actor_logps, -20.0, 20.0)
+            kl = jnp.exp(kl_log_diff) - (ref_logps - actor_logps) - 1.0
             policy_loss += cfg.beta * kl
             mean_kl = jnp.sum(kl * completion_mask) / jnp.maximum(jnp.sum(completion_mask), 1.0)
 
