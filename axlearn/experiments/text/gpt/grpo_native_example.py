@@ -24,6 +24,7 @@ from axlearn.common.grpo_learner import AxlearnGrpoLearner
 from axlearn.common.grpo_model import GrpoModel
 from axlearn.common.grpo_trainer import GrpoSpmdTrainer
 from axlearn.common.input_dispatch import SpmdInputDispatcher
+from axlearn.common.learner import UpdateType
 from axlearn.common.module import Module
 from axlearn.common.state_builder import Builder, TensorStoreStateStorageBuilder
 from axlearn.experiments.text.common import tfds_text_source, vocab
@@ -227,6 +228,7 @@ def trainer_configs(
             dtype=jnp.bfloat16,  # Explicitly set dtype to bfloat16 to reduce memory consumption by 50% and prevent OOM!
             actor=fuji_model_cfg,
             reference=fuji_model_cfg,
+            sampler=fuji_model_cfg,  # Instantiate decoupled sampler configuration
         )
 
         # 1. Configure a standard decoupled AdamW optimizer for SFT training
@@ -237,8 +239,10 @@ def trainer_configs(
             eps=1e-8,
         )
 
+        total_devices = len(jax.devices())
         logging.info(
-            "[eshenlog] Instantiating GrpoSpmdTrainer with custom 16-way FSDP sharding mesh..."
+            "[eshenlog] Instantiating GrpoSpmdTrainer with dynamic %d-device sharding mesh...",
+            total_devices,
         )
         trainer_cfg = GrpoSpmdTrainer.default_config().set(
             name="grpo_trainer",  # Explicitly set name to satisfy config requirements
@@ -253,16 +257,20 @@ def trainer_configs(
                 num_generations=2,  # <--- Sets Learner group size to 2!
                 beta=0.04,
                 optimizer=optimizer_cfg,  # <--- Satisfies required optimizer parameters!
+                update_rules=[
+                    ("reference/.*", UpdateType.NO_UPDATE),  # Freeze reference parameters
+                    ("sampler/.*", UpdateType.NO_UPDATE),  # Freeze sampler parameters
+                ],
             ),
             mesh_axis_names=MESH_AXIS_NAMES,  # Aligns natively with AXLearn's canonical 6D hybrid mesh constant!
             mesh_shape=[
                 1,
                 1,
                 1,
-                16,
+                total_devices,
                 1,
                 1,
-            ],  # <--- Overrides to fsdp=16 sharding mesh to prevent OOM!
+            ],  # <--- Dynamically scale global mesh to hold all available devices!
         )
 
         # Dynamically load pre-trained foundation weights from GCS at startup based on model size
