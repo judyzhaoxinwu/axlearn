@@ -665,9 +665,19 @@ def split_prng_keys_for_shard_map(
     def _axis_size(axis):
         if axis is None:
             return 1
+
+        def get_size(m, ax):
+            if ax in m.shape:
+                return m.shape[ax]
+            if ax in ("fsdp", "data") and "data" in m.shape:
+                return m.shape["data"]
+            if ax == "model" and "model" in m.shape:
+                return m.shape["model"]
+            return 1
+
         if isinstance(axis, tuple):
-            return math.prod(mesh.shape[a] for a in axis)
-        return mesh.shape[axis]
+            return math.prod(get_size(mesh, a) for a in axis)
+        return get_size(mesh, axis)
 
     axis_sizes = tuple(_axis_size(axis) for axis in sharding_spec)
     num_devices = math.prod(axis_sizes)
