@@ -84,6 +84,100 @@ T = TypeVar("T")
 # We avoid subscripting Sequence[int] so it can be used for isinstance checks.
 MeshShape = Sequence
 
+_orig_named_sharding = jax.sharding.NamedSharding  # pylint: disable=invalid-name
+
+
+class _ProxyMeta(type):
+    def __instancecheck__(cls, instance):
+        return isinstance(instance, _orig_named_sharding)
+
+
+def _canonicalize_spec(mesh, spec, trim_trailing_nones=False):
+    if spec is None:
+        return jax.sharding.PartitionSpec()
+    if not isinstance(spec, jax.sharding.PartitionSpec):
+        return spec
+    if mesh is None or mesh.empty:
+        return spec
+    new_specs = []
+    for s in spec:
+        if isinstance(s, str):
+            ax = s
+            if ax not in mesh.axis_names:
+                if ax in ("fsdp", "data") and "data" in mesh.axis_names:
+                    ax = "data"
+                elif ax == "model" and "model" in mesh.axis_names:
+                    ax = "model"
+                else:
+                    ax = None
+            if ax is not None and mesh.shape.get(ax, 1) > 1:
+                new_specs.append(ax)
+            else:
+                new_specs.append(None)
+        elif isinstance(s, tuple):
+            sub = []
+            for x in s:
+                ax = x
+                if ax not in mesh.axis_names:
+                    if ax in ("fsdp", "data") and "data" in mesh.axis_names:
+                        ax = "data"
+                    elif ax == "model" and "model" in mesh.axis_names:
+                        ax = "model"
+                    else:
+                        ax = None
+                if ax is not None and mesh.shape.get(ax, 1) > 1 and ax not in sub:
+                    sub.append(ax)
+            new_specs.append(tuple(sub) if sub else None)
+        else:
+            new_specs.append(s)
+    if trim_trailing_nones:
+        while new_specs and new_specs[-1] is None:
+            new_specs.pop()
+    return jax.sharding.PartitionSpec(*new_specs)
+
+
+class _PatchedNamedShardingProxy(metaclass=_ProxyMeta):
+    def __new__(cls, mesh, spec, *args, **kwargs):
+        if mesh is not None and not mesh.empty and isinstance(spec, jax.sharding.PartitionSpec):
+            spec = _canonicalize_spec(mesh, spec, trim_trailing_nones=False)
+        return _orig_named_sharding(mesh, spec, *args, **kwargs)
+
+
+for mod_name in (
+    "jax.sharding",
+    "jax",
+    "jax._src.named_sharding",
+    "jax._src.sharding",
+    "jax._src.sharding_impls",
+):
+    if mod_name in sys.modules:
+        sys.modules[mod_name].NamedSharding = _PatchedNamedShardingProxy
+
+_orig_shard_map = jax.shard_map
+
+
+def _patched_shard_map(f=None, *, mesh=None, in_specs=None, out_specs=None, **kwargs):
+    if f is None:
+        return functools.partial(
+            _patched_shard_map, mesh=mesh, in_specs=in_specs, out_specs=out_specs, **kwargs
+        )
+
+    def tree_canon(specs):
+        return jax.tree.map(
+            lambda s: _canonicalize_spec(mesh, s, trim_trailing_nones=True),
+            specs,
+            is_leaf=lambda x: isinstance(x, jax.sharding.PartitionSpec),
+        )
+
+    return _orig_shard_map(
+        f, mesh=mesh, in_specs=tree_canon(in_specs), out_specs=tree_canon(out_specs), **kwargs
+    )
+
+
+jax.shard_map = _patched_shard_map
+if "jax.experimental.shard_map" in sys.modules:
+    sys.modules["jax.experimental.shard_map"].shard_map = _patched_shard_map
+
 _enable_numeric_checks = False
 _enable_xla_runtime_errors = False
 
