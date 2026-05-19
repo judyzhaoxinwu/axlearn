@@ -685,6 +685,10 @@ def split_prng_keys_for_shard_map(
     if num_devices == 1:
         return prng_key
 
+    if jnp.ndim(prng_key) == 0:
+        keys = jax.random.split(prng_key, num_devices)
+        return keys.reshape(axis_sizes)
+
     chex.assert_rank(prng_key, 1)
     keys = jax.random.split(prng_key, num_devices)
     out_shape = axis_sizes[:-1] + (axis_sizes[-1] * prng_key.size,)
