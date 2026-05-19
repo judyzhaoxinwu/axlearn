@@ -178,6 +178,18 @@ jax.shard_map = _patched_shard_map
 if "jax.experimental.shard_map" in sys.modules:
     sys.modules["jax.experimental.shard_map"].shard_map = _patched_shard_map
 
+# Out-of-tree monkey patch for tpu-inference to fix multi-device HBM usage scaling bug
+if "tpu_inference.utils" in sys.modules:
+    _orig_hbm_usage_bytes = sys.modules["tpu_inference.utils"].hbm_usage_bytes
+
+    def _patched_hbm_usage_bytes(devices):
+        stats = _orig_hbm_usage_bytes(devices)
+        if stats:
+            return stats[:1]
+        return stats
+
+    sys.modules["tpu_inference.utils"].hbm_usage_bytes = _patched_hbm_usage_bytes
+
 _enable_numeric_checks = False
 _enable_xla_runtime_errors = False
 
