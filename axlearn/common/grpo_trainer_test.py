@@ -104,9 +104,11 @@ class GrpoTrainerTest(test_utils.TestCase):
     """Tests GrpoSpmdTrainer disaggregated execution."""
 
     @parameterized.parameters(
-        {"platform": "cpu", "mesh_shape": (1, 1, 1, 8, 1, 1)},
+        {"platform": "cpu", "mesh_shape": (1, 1, 1, 8, 1, 1), "reward_type": "gsm8k"},
+        {"platform": "cpu", "mesh_shape": (1, 1, 1, 8, 1, 1), "reward_type": "dummy"},
+        {"platform": "cpu", "mesh_shape": (1, 1, 1, 8, 1, 1), "reward_type": "exact_match"},
     )
-    def test_disaggregated_trainer(self, platform, mesh_shape):
+    def test_disaggregated_trainer(self, platform, mesh_shape, reward_type):
         if not test_utils.is_supported_platform(platform):
             return
 
@@ -116,6 +118,7 @@ class GrpoTrainerTest(test_utils.TestCase):
             dir=tempfile.mkdtemp(),
             mesh_axis_names=("pipeline", "data", "expert", "fsdp", "seq", "model"),
             mesh_shape=mesh_shape,
+            reward_type=reward_type,
             model=GrpoModel.default_config().set(
                 name="model",
                 dtype=jnp.float32,

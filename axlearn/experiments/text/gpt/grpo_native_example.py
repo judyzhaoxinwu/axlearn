@@ -2,12 +2,13 @@
 
 """Driver configurations module utilizing tfds_input over local/remote sources, fully supporting Meta's LLaMA-3.1-8B and 70B configurations."""
 
+import os
 from typing import Dict, Optional
 
 import jax
 import jax.numpy as jnp
 import tensorflow as tf
-from absl import logging
+from absl import flags, logging
 from jax.sharding import PartitionSpec
 
 from axlearn.common import input_base, input_lm, input_tf_data, optimizers
@@ -29,9 +30,11 @@ from axlearn.common.module import Module
 from axlearn.common.state_builder import Builder, TensorStoreStateStorageBuilder
 from axlearn.experiments.text.common import tfds_text_source, vocab
 from axlearn.experiments.text.gpt import fuji
-from axlearn.experiments.text.gpt.common import MESH_AXIS_NAMES
+from axlearn.experiments.text.gpt.common import MESH_AXIS_NAMES, mesh_shape_from_axes
 from axlearn.experiments.text.gpt.vocabulary_fuji_v3 import FujiV3Vocabulary
 from axlearn.tools.convert_gsm8k_to_tfrecord import verify_and_print_records
+
+grpo_reward_type = os.getenv("GRPO_REWARD_TYPE", "dummy")
 
 
 class GRPOV3Vocabulary(FujiV3Vocabulary):
@@ -173,11 +176,16 @@ class GRPOStateBuilder(Builder):
         flat_state = self.storage_builder(flat_builder_state)
         flat_model = flat_state.trainer_state.model
 
-        # 3. Manually replicate the restored parameters into both Actor and Reference policy sub-trees recursively!
-        # Physically copy/clone the Reference parameters PyTree using jax.tree.map(jnp.copy)
+        # 3. Manually replicate the restored parameters into Actor, Reference, and Sampler policy sub-trees recursively!
+        # Physically copy/clone the parameters PyTree using jax.tree.map(jnp.copy)
         # to create independent device buffers and prevent JAX double-donation crashes!
         cloned_reference_model = jax.tree.map(jnp.copy, flat_model)
-        actor_ref_model = {"actor": flat_model, "reference": cloned_reference_model}
+        cloned_sampler_model = jax.tree.map(jnp.copy, flat_model)
+        actor_ref_model = {
+            "actor": flat_model,
+            "reference": cloned_reference_model,
+            "sampler": cloned_sampler_model,
+        }
 
         # 4. Rebuild the fully populated JAX TrainerState PyTree seamlessly
         updated_trainer_state = state.trainer_state._replace(model=actor_ref_model)
@@ -247,6 +255,8 @@ def trainer_configs(
         trainer_cfg = GrpoSpmdTrainer.default_config().set(
             name="grpo_trainer",  # Explicitly set name to satisfy config requirements
             model=grpo_model_cfg,
+            reward_type=grpo_reward_type,
+            start_trace_steps=[],
             vocab=_vocab_cfg(
                 vocab_size
             ),  # <--- Passes the sentencepiece vocabulary directly to the trainer!
@@ -263,14 +273,9 @@ def trainer_configs(
                 ],
             ),
             mesh_axis_names=MESH_AXIS_NAMES,  # Aligns natively with AXLearn's canonical 6D hybrid mesh constant!
-            mesh_shape=[
-                1,
-                1,
-                1,
-                total_devices,
-                1,
-                1,
-            ],  # <--- Dynamically scale global mesh to hold all available devices!
+            mesh_shape=mesh_shape_from_axes(
+                fsdp=-1
+            ),  # <--- Dynamically scale global mesh using AXLearn's native -1 inference!
         )
 
         # Dynamically load pre-trained foundation weights from GCS at startup based on model size
@@ -285,6 +290,7 @@ def trainer_configs(
             storage_builder_cfg = TensorStoreStateStorageBuilder.default_config().set(
                 dir=f"gs://ericshen-axlearn/checkpoints/{gcs_dir_name}/step_00000000",
                 validation="CONTAINS_STATE_UP_TO_DTYPE",  # <--- Ignores float32 to bfloat16 dtype differences and casts on the fly!
+                concurrent_gb=4,  # <--- Restrict concurrent restore to 4GB to prevent head pod OOMKilled!
             )
 
             # Use custom GRPOStateBuilder to manually replicate flat GCS parameters into both policy sub-trees!
@@ -337,6 +343,13 @@ def trainer_configs(
                         "param_partition_spec": ("model", ("expert", "fsdp", "seq"))
                     },
                     "model.reference.decoder.emb.token_emb": {
+                        "param_partition_spec": ("model", ("expert", "fsdp", "seq"))
+                    },
+                    # Sampler layers sharding overrides
+                    "model.sampler.decoder.lm_head": {
+                        "param_partition_spec": ("model", ("expert", "fsdp", "seq"))
+                    },
+                    "model.sampler.decoder.emb.token_emb": {
                         "param_partition_spec": ("model", ("expert", "fsdp", "seq"))
                     },
                 }
