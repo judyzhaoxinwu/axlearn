@@ -6,8 +6,8 @@ The generation and training workloads are decoupled onto distinct hardware parti
 
 
 # Setup
-* Training dataset: gsm8k
-* Pretrained model: Llama-3.1-8B-Instruct compatible with fuji-8B. The model is the base for actor, reference, and sampler
+* Training dataset: [gsm8k  ](https://www.tensorflow.org/datasets/catalog/gsm8k)
+* Pretrained model: [Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct) compatible with fuji-8B. The model is the base for actor, reference, and sampler
 * TPU Topology: v6e-16
 * GKE Nodepool
   * Pathways: n2-standard-64 (autoscale up to 10)
