@@ -6,18 +6,18 @@ The generation and training workloads are decoupled onto distinct hardware parti
 
 
 # Setup
-* Training dataset: gsm8k  
+* Training dataset: gsm8k
 * Pretrained model: Llama-3.1-8B-Instruct compatible with fuji-8B. The model is the base for actor, reference, and sampler
 * TPU Topology: v6e-16
 * GKE Nodepool
   * Pathways: n2-standard-64 (autoscale up to 10)
-  * Workers: 4 x ct6e-standard-4t 
+  * Workers: 4 x ct6e-standard-4t
 * Global mesh: (1, 1, 8, 8, 1, 1), data and fsdp parallelism on data and fsdp dimensions
 * rollout_mesh: (1, 1, 8, 1, 1, 1), tensor/data parallelism on data dimension
 * trainer_mesh: (1, 1, 1, 8, 1, 1), fsdp parallelism on fsdp dimension
 
 # Pre Requisite
-The utility scripts rely on Axlearn and follow the [instructions](https://github.com/apple/axlearn/blob/main/docs/01-start.md#installation) to set up your Axlearn env and install the packages for dev. You may need a machine with high memory to run the script. 
+The utility scripts rely on Axlearn and follow the [instructions](https://github.com/apple/axlearn/blob/main/docs/01-start.md#installation) to set up your Axlearn env and install the packages for dev. You may need a machine with high memory to run the script.
 
 ## Training Dataset gsm8k
 To prepare the GSM8K reasoning dataset for AXLearn training pipelines, the raw data must be downloaded and serialized into sharded TFRecord files. The example provides a dedicated conversion utility convert_gsm8k_to_tfrecord.py.
@@ -37,7 +37,7 @@ Run the following command to download and convert the LLaMA-3.1 8B Instruct mode
 
 ```shell
 python3 -m axlearn.tools.download_llama3_checkpoint \
-    --model_id="meta-llama/Llama-3.1-8B-Instruct" \ 
+    --model_id="meta-llama/Llama-3.1-8B-Instruct" \
     --model_size="8B" \
     --output_dir="gs://ericshen-axlearn/checkpoints/llama-3-1-8B-instruct" # change to your gcs location
 
@@ -68,7 +68,7 @@ export OUTPUT_DIR="gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/${NAME}/$(
   --bundler_type=artifactregistry \
   --bundler_spec=image=tpu \
   --bundler_spec=dockerfile=Dockerfile \
-  --bundler_spec=target=tpu --pathways_head_mem=128 --pathways_head_cpu=8 --env=GRPO_REWARD_TYPE:gsm8k \ #set the reward_type to gsm8k. otherwise it'd be dummy reward. 
+  --bundler_spec=target=tpu --pathways_head_mem=128 --pathways_head_cpu=8 --env=GRPO_REWARD_TYPE:gsm8k \ #set the reward_type to gsm8k. otherwise it'd be dummy reward.
   -- \
   python3 -m axlearn.common.launch_trainer_main \
   --module=text.gpt.grpo_native_example \
@@ -120,7 +120,3 @@ gcloud storage cat gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/eshen-v6e-
 # get trainer config
 gcloud storage cat gs://cloud-tpu-multipod-dev-axlearn/users/ericshen/eshen-v6e-rl-grpo/1778611794/trainer_config
 ```
-
-
-
-
