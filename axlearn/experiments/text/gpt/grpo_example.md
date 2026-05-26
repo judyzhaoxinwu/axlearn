@@ -88,7 +88,7 @@ During GRPO training, AXLearn logs several crucial telemetry metrics to track po
 * `std_advantage`: The standard deviation of the computed advantages across rollouts, reflecting the variance and diversity of rewards within the generated groups.
 * `kl_divergence`: The token-level Kullback-Leibler (KL) divergence between the active Actor policy and the frozen Reference policy. This tracks how far the model's generation distribution has shifted from the initial pre-trained foundation checkpoint.
 
-`Sample output`: [TBD]()
+`Sample output`: [grpo_pathways_sample_output](./grpo_pythways_sample_output.md)
 
 ## Monitoring & Checking
 ### Kubectl logs
