@@ -1,11 +1,9 @@
-
 load("@axlearn_pip//:requirements.bzl", "all_whl_requirements")
 load("@bazel_gazelle//:def.bzl", "gazelle", "gazelle_binary")
 load("@rules_python//python:defs.bzl", "py_library")
 load("@rules_python//python/uv:lock.bzl", "lock")
 load("@rules_python_gazelle_plugin//manifest:defs.bzl", "gazelle_python_manifest")
 load("@rules_python_gazelle_plugin//modules_mapping:def.bzl", "modules_mapping")
-
 
 # Top-level Gazelle directives.
 # gazelle:python_generation_mode file
@@ -47,7 +45,6 @@ gazelle(
     name = "gazelle",
     gazelle = ":gazelle_binary",
 )
-
 
 lock(
     name = "requirements",

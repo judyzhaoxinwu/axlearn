@@ -1375,7 +1375,21 @@ def scan_in_context(
         else:
             remat_kwargs["prevent_cse"] = False
         scan_fn = jax.checkpoint(scan_fn, **remat_kwargs)
-    carry, scan_ys = jax.lax.scan(scan_fn, init=carry, xs=xs, unroll=unroll)
+
+    if isinstance(unroll, bool) and unroll:
+        # Pure Python loop instead of jax.lax.scan!
+        # This is crucial for serving to avoid nested tracer transformations
+        # and allow dynamic side-effects like updating global KV caches.
+        num_iters = jax.tree_util.tree_leaves(xs)[0].shape[0]
+        ys_list = []
+        for i in range(num_iters):
+            scan_i = jax.tree.map(lambda x: x[i], xs)
+            carry, ys_i = scan_fn(carry, scan_i)
+            ys_list.append(ys_i)
+        scan_ys = jax.tree.map(lambda *args: jnp.stack(args), *ys_list)
+    else:
+        carry, scan_ys = jax.lax.scan(scan_fn, init=carry, xs=xs, unroll=unroll)
+
     propagate_repeated_output_collections(
         scan_ys.pop("output_collection"),
         child_name_prefix=child_name_prefix,

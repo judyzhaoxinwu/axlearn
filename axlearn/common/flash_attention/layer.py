@@ -175,10 +175,20 @@ class FlashAttention(GroupedQueryAttention):
             return key_or_value
 
         axis = partition_spec[-2]
+
+        def get_axis_size(mesh, ax):
+            if ax in mesh.shape:
+                return mesh.shape[ax]
+            if ax in ("fsdp", "data") and "data" in mesh.shape:
+                return mesh.shape["data"]
+            if ax == "model" and "model" in mesh.shape:
+                return mesh.shape["model"]
+            return 1
+
         if isinstance(axis, tuple):
-            axis_size = np.prod([global_mesh.shape[x] for x in axis])
+            axis_size = np.prod([get_axis_size(global_mesh, x) for x in axis])
         else:
-            axis_size = global_mesh.shape[axis]
+            axis_size = get_axis_size(global_mesh, axis)
         # There will be sharding error if axis_size > num_heads.
         if cfg.num_heads < axis_size:
             raise ValueError(
