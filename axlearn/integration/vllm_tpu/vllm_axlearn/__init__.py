@@ -18,7 +18,7 @@ import os
 import sys
 
 from tpu_inference.logger import init_logger
-from tpu_inference.models import register_model
+from tpu_inference.models.common.model_loader import register_model
 
 from .axlearn_model import AxLearnForCausalLM
 
