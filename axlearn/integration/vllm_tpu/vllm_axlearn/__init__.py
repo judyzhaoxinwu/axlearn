@@ -67,10 +67,11 @@ try:
 
     def _custom_mesh_new(cls, devices, axis_names, axis_types=None, *args, **kwargs):
         axis_names = list(axis_names)
-        # If running locally on a single device (devices.size == 1), and the number of axis names
-        # exceeds the dimensions of the devices array, dynamically align dimensions and axis_types!
-        if len(axis_names) > devices.ndim and devices.size == 1:
-            devices = np.array(devices).reshape((1,) * len(axis_names))
+        # If the number of axis names exceeds the dimensions of the devices array,
+        # dynamically align dimensions and axis_types for both single and multi-device meshes!
+        if len(axis_names) > devices.ndim:
+            new_shape = devices.shape + (1,) * (len(axis_names) - devices.ndim)
+            devices = np.array(devices).reshape(new_shape)
             if axis_types is not None:
                 from jax.sharding import AxisType
 
