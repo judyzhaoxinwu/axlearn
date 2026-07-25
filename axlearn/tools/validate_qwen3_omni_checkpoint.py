@@ -169,166 +169,187 @@ def validate_checkpoint(ckpt_dir: str):
     logging.info("lm_head absolute max difference: %e", head_diff)
     assert head_diff < 1e-5, f"LM Head numerical discrepancy exceeded threshold: {head_diff}"
 
-    # 3. Verify Layer 1 attention projections (4D layouts mapping)
-    first_layer = text_model.model.layers[0]
-    hidden_dim = first_layer.input_layernorm.weight.shape[0]
+    num_layers = len(text_model.model.layers)
+    logging.info(
+        f"Verifying all {num_layers} layers across QKV, O Proj, Scales, Gate, wi_0, wi_1, and wo..."
+    )
 
-    # Retrieve restored attention qkv weights (which are 4D [hidden_dim, 40, 128])
-    jax_qkv = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["self_attention"][
-        "attention"
-    ]["i_proj"]["i_proj"]["qkv_proj"]["weight"][0]
-    q = first_layer.self_attn.q_proj.weight.detach().cpu().to(torch.float32).numpy()
-    k = first_layer.self_attn.k_proj.weight.detach().cpu().to(torch.float32).numpy()
-    v = first_layer.self_attn.v_proj.weight.detach().cpu().to(torch.float32).numpy()
+    for idx in range(num_layers):
+        layer_hf = text_model.model.layers[idx]
+        hidden_dim = layer_hf.input_layernorm.weight.shape[0]
 
-    q = q.reshape(32, 128, hidden_dim)
-    k = k.reshape(4, 128, hidden_dim)
-    v = v.reshape(4, 128, hidden_dim)
+        # Retrieve restored attention qkv weights
+        jax_qkv = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["self_attention"][
+            "attention"
+        ]["i_proj"]["i_proj"]["qkv_proj"]["weight"][idx]
+        q = layer_hf.self_attn.q_proj.weight.detach().cpu().to(torch.float32).numpy()
+        k = layer_hf.self_attn.k_proj.weight.detach().cpu().to(torch.float32).numpy()
+        v = layer_hf.self_attn.v_proj.weight.detach().cpu().to(torch.float32).numpy()
 
-    # Permute the PyTorch Q and K weights to interleaved layout in the validation script
-    # to perfectly match our new, offline-permuted sharded TensorStore checkpoint!
-    q_permuted = permute_q_k_for_rope_numpy(q)
-    k_permuted = permute_q_k_for_rope_numpy(k)
+        q = q.reshape(32, 128, hidden_dim)
+        k = k.reshape(4, 128, hidden_dim)
+        v = v.reshape(4, 128, hidden_dim)
 
-    hf_qkv = np.concatenate([q_permuted, k_permuted, v], axis=0).transpose(
-        2, 0, 1
-    )  # Transpose to [hidden_dim, 40, 128]
+        q_permuted = permute_q_k_for_rope_numpy(q)
+        k_permuted = permute_q_k_for_rope_numpy(k)
 
-    assert (
-        hf_qkv.shape == jax_qkv.shape
-    ), f"QKV shape mismatch! HF: {hf_qkv.shape}, JAX: {jax_qkv.shape}"
-    qkv_diff = np.max(np.abs(hf_qkv - jax_qkv))
-    logging.info("Layer 1 QKV absolute max difference: %e", qkv_diff)
-    assert qkv_diff < 1e-5, f"QKV numerical discrepancy exceeded threshold: {qkv_diff}"
+        hf_qkv = np.concatenate([q_permuted, k_permuted, v], axis=0).transpose(
+            2, 0, 1
+        )  # Transpose to [hidden_dim, 40, 128]
 
-    # 4. Verify Layer 1 attention o_proj
-    jax_o = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["self_attention"][
-        "attention"
-    ]["o_proj"]["weight"][0]
-    o = first_layer.self_attn.o_proj.weight.detach().cpu().to(torch.float32).numpy()
-    hf_o = o.reshape(hidden_dim, 32, 128)
+        assert (
+            hf_qkv.shape == jax_qkv.shape
+        ), f"Layer {idx} QKV shape mismatch! HF: {hf_qkv.shape}, JAX: {jax_qkv.shape}"
+        qkv_diff = np.max(np.abs(hf_qkv - jax_qkv))
+        assert (
+            qkv_diff < 1e-5
+        ), f"Layer {idx} QKV numerical discrepancy exceeded threshold: {qkv_diff}"
 
-    assert hf_o.shape == jax_o.shape, f"O Proj shape mismatch! HF: {hf_o.shape}, JAX: {jax_o.shape}"
-    o_diff = np.max(np.abs(hf_o - jax_o))
-    logging.info("Layer 1 O Proj absolute max difference: %e", o_diff)
-    assert o_diff < 1e-5, f"O Proj numerical discrepancy exceeded threshold: {o_diff}"
+        # 4. Verify attention o_proj
+        jax_o = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["self_attention"][
+            "attention"
+        ]["o_proj"]["weight"][idx]
+        o = layer_hf.self_attn.o_proj.weight.detach().cpu().to(torch.float32).numpy()
+        hf_o = o.reshape(hidden_dim, 32, 128)
 
-    # 5. Verify Layer 1 QK-Norm Scales (at their inner attention paths!)
-    jax_scale_query = jax_model_params["decoder"]["transformer"]["repeat"]["layer"][
-        "self_attention"
-    ]["attention"]["i_proj"]["scale_query"]["norm"]["scale"][0]
-    jax_scale_key = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["self_attention"][
-        "attention"
-    ]["i_proj"]["scale_key"]["norm"]["scale"][0]
+        assert (
+            hf_o.shape == jax_o.shape
+        ), f"Layer {idx} O Proj shape mismatch! HF: {hf_o.shape}, JAX: {jax_o.shape}"
+        o_diff = np.max(np.abs(hf_o - jax_o))
+        assert (
+            o_diff < 1e-5
+        ), f"Layer {idx} O Proj numerical discrepancy exceeded threshold: {o_diff}"
 
-    hf_scale_query = first_layer.self_attn.q_norm.weight.detach().cpu().to(torch.float32).numpy()
-    hf_scale_key = first_layer.self_attn.k_norm.weight.detach().cpu().to(torch.float32).numpy()
+        # 5. Verify QK-Norm Scales (at their inner attention paths!)
+        jax_scale_query = jax_model_params["decoder"]["transformer"]["repeat"]["layer"][
+            "self_attention"
+        ]["attention"]["i_proj"]["scale_query"]["norm"]["scale"][idx]
+        jax_scale_key = jax_model_params["decoder"]["transformer"]["repeat"]["layer"][
+            "self_attention"
+        ]["attention"]["i_proj"]["scale_key"]["norm"]["scale"][idx]
 
-    assert hf_scale_query.shape == jax_scale_query.shape, f"Scale Query shape mismatch!"
-    assert hf_scale_key.shape == jax_scale_key.shape, f"Scale Key shape mismatch!"
+        hf_scale_query = layer_hf.self_attn.q_norm.weight.detach().cpu().to(torch.float32).numpy()
+        hf_scale_key = layer_hf.self_attn.k_norm.weight.detach().cpu().to(torch.float32).numpy()
 
-    query_norm_diff = np.max(np.abs(hf_scale_query - jax_scale_query))
-    key_norm_diff = np.max(np.abs(hf_scale_key - jax_scale_key))
+        assert (
+            hf_scale_query.shape == jax_scale_query.shape
+        ), f"Layer {idx} Scale Query shape mismatch!"
+        assert hf_scale_key.shape == jax_scale_key.shape, f"Layer {idx} Scale Key shape mismatch!"
 
-    logging.info("Layer 1 Scale Query absolute max difference: %e", query_norm_diff)
-    logging.info("Layer 1 Scale Key absolute max difference: %e", key_norm_diff)
+        query_norm_diff = np.max(np.abs(hf_scale_query - jax_scale_query))
+        key_norm_diff = np.max(np.abs(hf_scale_key - jax_scale_key))
 
-    assert query_norm_diff < 1e-5, f"Scale Query discrepancy exceeded threshold!"
-    assert key_norm_diff < 1e-5, f"Scale Key discrepancy exceeded threshold!"
+        assert (
+            query_norm_diff < 1e-5
+        ), f"Layer {idx} Scale Query discrepancy exceeded threshold: {query_norm_diff}"
+        assert (
+            key_norm_diff < 1e-5
+        ), f"Layer {idx} Scale Key discrepancy exceeded threshold: {key_norm_diff}"
 
-    # 6. Verify Layer 1 Sparse MoE parameters
-    jax_moe_gate = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["feed_forward"][
-        "gate_weight"
-    ][0]
-    hf_moe_gate = first_layer.mlp.gate.weight.detach().cpu().to(torch.float32).numpy().T
-    assert (
-        hf_moe_gate.shape == jax_moe_gate.shape
-    ), f"MoE Gate shape mismatch! HF: {hf_moe_gate.shape}, JAX: {jax_moe_gate.shape}"
-    gate_diff = np.max(np.abs(hf_moe_gate - jax_moe_gate))
-    logging.info("Layer 1 MoE Gate absolute max difference: %e", gate_diff)
-    assert gate_diff < 1e-5, f"MoE Gate numerical discrepancy exceeded threshold: {gate_diff}"
+        # 6. Verify Sparse MoE parameters
+        jax_moe_gate = jax_model_params["decoder"]["transformer"]["repeat"]["layer"][
+            "feed_forward"
+        ]["gate_weight"][idx]
+        hf_moe_gate = layer_hf.mlp.gate.weight.detach().cpu().to(torch.float32).numpy().T
+        assert (
+            hf_moe_gate.shape == jax_moe_gate.shape
+        ), f"Layer {idx} MoE Gate shape mismatch! HF: {hf_moe_gate.shape}, JAX: {jax_moe_gate.shape}"
+        gate_diff = np.max(np.abs(hf_moe_gate - jax_moe_gate))
+        assert (
+            gate_diff < 1e-5
+        ), f"Layer {idx} MoE Gate numerical discrepancy exceeded threshold: {gate_diff}"
 
-    # 7. Verify Layer 1 Sparse MoE Expert Projections (wi_0, wi_1, wo)
-    logging.info("Verifying Layer 1 MoE expert projection weights (wi_0, wi_1, wo)...")
-    jax_wi_0 = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["feed_forward"][
-        "wi_0_weight"
-    ][0]
-    jax_wi_1 = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["feed_forward"][
-        "wi_1_weight"
-    ][0]
-    jax_wo = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["feed_forward"][
-        "wo_weight"
-    ][0]
+        # 7. Verify Sparse MoE Expert Projections (wi_0, wi_1, wo)
+        jax_wi_0 = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["feed_forward"][
+            "wi_0_weight"
+        ][idx]
+        jax_wi_1 = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["feed_forward"][
+            "wi_1_weight"
+        ][idx]
+        jax_wo = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["feed_forward"][
+            "wo_weight"
+        ][idx]
 
-    if hasattr(first_layer.mlp, "experts") and isinstance(
-        first_layer.mlp.experts, (list, torch.nn.ModuleList)
-    ):
-        num_experts = len(first_layer.mlp.experts)
-        hf_wi_0 = np.stack(
-            [
-                first_layer.mlp.experts[e]
-                .gate_proj.weight.detach()
-                .cpu()
-                .to(torch.float32)
-                .numpy()
-                .T
-                for e in range(num_experts)
-            ],
-            axis=0,
+        if hasattr(layer_hf.mlp, "experts") and isinstance(
+            layer_hf.mlp.experts, (list, torch.nn.ModuleList)
+        ):
+            num_experts = len(layer_hf.mlp.experts)
+            hf_wi_0 = np.stack(
+                [
+                    layer_hf.mlp.experts[e]
+                    .gate_proj.weight.detach()
+                    .cpu()
+                    .to(torch.float32)
+                    .numpy()
+                    .T
+                    for e in range(num_experts)
+                ],
+                axis=0,
+            )
+            hf_wi_1 = np.stack(
+                [
+                    layer_hf.mlp.experts[e]
+                    .up_proj.weight.detach()
+                    .cpu()
+                    .to(torch.float32)
+                    .numpy()
+                    .T
+                    for e in range(num_experts)
+                ],
+                axis=0,
+            )
+            hf_wo = np.stack(
+                [
+                    layer_hf.mlp.experts[e]
+                    .down_proj.weight.detach()
+                    .cpu()
+                    .to(torch.float32)
+                    .numpy()
+                    .T
+                    for e in range(num_experts)
+                ],
+                axis=0,
+            )
+        else:
+            gate_up_fused = (
+                layer_hf.mlp.experts.gate_up_proj.weight.detach().cpu().to(torch.float32).numpy()
+            )
+            num_experts = jax_wi_0.shape[0]
+            intermediate_dim = jax_wi_0.shape[2]
+            hidden_dim = jax_wi_0.shape[1]
+            gate_up = gate_up_fused.reshape(num_experts, 2, intermediate_dim, hidden_dim)
+            hf_wi_0 = gate_up[:, 0, :, :].transpose(0, 2, 1)
+            hf_wi_1 = gate_up[:, 1, :, :].transpose(0, 2, 1)
+            down_fused = (
+                layer_hf.mlp.experts.down_proj.weight.detach().cpu().to(torch.float32).numpy()
+            )
+            hf_wo = down_fused.transpose(0, 2, 1)
+
+        assert (
+            hf_wi_0.shape == jax_wi_0.shape
+        ), f"Layer {idx} wi_0 shape mismatch! HF: {hf_wi_0.shape}, JAX: {jax_wi_0.shape}"
+        assert (
+            hf_wi_1.shape == jax_wi_1.shape
+        ), f"Layer {idx} wi_1 shape mismatch! HF: {hf_wi_1.shape}, JAX: {jax_wi_1.shape}"
+        assert (
+            hf_wo.shape == jax_wo.shape
+        ), f"Layer {idx} wo shape mismatch! HF: {hf_wo.shape}, JAX: {jax_wo.shape}"
+
+        wi_0_diff = np.max(np.abs(hf_wi_0 - jax_wi_0))
+        wi_1_diff = np.max(np.abs(hf_wi_1 - jax_wi_1))
+        wo_diff = np.max(np.abs(hf_wo - jax_wo))
+
+        assert (
+            wi_0_diff < 1e-5
+        ), f"Layer {idx} wi_0 numerical discrepancy exceeded threshold: {wi_0_diff}"
+        assert (
+            wi_1_diff < 1e-5
+        ), f"Layer {idx} wi_1 numerical discrepancy exceeded threshold: {wi_1_diff}"
+        assert wo_diff < 1e-5, f"Layer {idx} wo numerical discrepancy exceeded threshold: {wo_diff}"
+
+        logging.info(
+            f"Layer {idx:02d} OK | max diffs -> QKV: {qkv_diff:.2e}, O: {o_diff:.2e}, Gate: {gate_diff:.2e}, wi_0: {wi_0_diff:.2e}, wi_1: {wi_1_diff:.2e}, wo: {wo_diff:.2e}"
         )
-        hf_wi_1 = np.stack(
-            [
-                first_layer.mlp.experts[e].up_proj.weight.detach().cpu().to(torch.float32).numpy().T
-                for e in range(num_experts)
-            ],
-            axis=0,
-        )
-        hf_wo = np.stack(
-            [
-                first_layer.mlp.experts[e]
-                .down_proj.weight.detach()
-                .cpu()
-                .to(torch.float32)
-                .numpy()
-                .T
-                for e in range(num_experts)
-            ],
-            axis=0,
-        )
-    else:
-        gate_up_fused = (
-            first_layer.mlp.experts.gate_up_proj.weight.detach().cpu().to(torch.float32).numpy()
-        )
-        num_experts = jax_wi_0.shape[0]
-        intermediate_dim = jax_wi_0.shape[2]
-        hidden_dim = jax_wi_0.shape[1]
-        gate_up = gate_up_fused.reshape(num_experts, 2, intermediate_dim, hidden_dim)
-        hf_wi_0 = gate_up[:, 0, :, :].transpose(0, 2, 1)
-        hf_wi_1 = gate_up[:, 1, :, :].transpose(0, 2, 1)
-        down_fused = (
-            first_layer.mlp.experts.down_proj.weight.detach().cpu().to(torch.float32).numpy()
-        )
-        hf_wo = down_fused.transpose(0, 2, 1)
-
-    assert (
-        hf_wi_0.shape == jax_wi_0.shape
-    ), f"wi_0 shape mismatch! HF: {hf_wi_0.shape}, JAX: {jax_wi_0.shape}"
-    assert (
-        hf_wi_1.shape == jax_wi_1.shape
-    ), f"wi_1 shape mismatch! HF: {hf_wi_1.shape}, JAX: {jax_wi_1.shape}"
-    assert hf_wo.shape == jax_wo.shape, f"wo shape mismatch! HF: {hf_wo.shape}, JAX: {jax_wo.shape}"
-
-    wi_0_diff = np.max(np.abs(hf_wi_0 - jax_wi_0))
-    wi_1_diff = np.max(np.abs(hf_wi_1 - jax_wi_1))
-    wo_diff = np.max(np.abs(hf_wo - jax_wo))
-
-    logging.info("Layer 1 MoE wi_0 absolute max difference: %e", wi_0_diff)
-    logging.info("Layer 1 MoE wi_1 absolute max difference: %e", wi_1_diff)
-    logging.info("Layer 1 MoE wo absolute max difference: %e", wo_diff)
-
-    assert wi_0_diff < 1e-5, f"wi_0 numerical discrepancy exceeded threshold: {wi_0_diff}"
-    assert wi_1_diff < 1e-5, f"wi_1 numerical discrepancy exceeded threshold: {wi_1_diff}"
-    assert wo_diff < 1e-5, f"wo numerical discrepancy exceeded threshold: {wo_diff}"
 
     logging.info("\n==============================================================")
     logging.info(
