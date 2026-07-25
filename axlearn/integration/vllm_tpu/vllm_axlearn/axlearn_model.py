@@ -443,7 +443,10 @@ class AxLearnForCausalLM(nnx.Module):
             ffn_layer_types = None
             expert_cfg = None
             if num_experts is not None:
-                from axlearn.common.mixture_of_experts import TopKGating, TransformerFeedForwardMoE
+                from axlearn.common.mixture_of_experts import (
+                    TopKDropFreeGating,
+                    TransformerFeedForwardDropFreeMoE,
+                )
 
                 ffn_layer_types = ["sparse"]
                 num_experts_per_token = getattr(
@@ -453,7 +456,7 @@ class AxLearnForCausalLM(nnx.Module):
                 )
                 from axlearn.common.utils import PartitionSpec
 
-                expert_cfg = TransformerFeedForwardMoE.default_config().set(
+                expert_cfg = TransformerFeedForwardDropFreeMoE.default_config().set(
                     num_experts=num_experts,
                     num_groups=1,
                     dim_to_mesh_axis_map={
@@ -466,10 +469,9 @@ class AxLearnForCausalLM(nnx.Module):
                         "ogecm": PartitionSpec("data", "expert", None, None, "model"),
                         "oegch": PartitionSpec("data", "expert", None, None, "model"),
                     },
-                    gating=TopKGating.default_config().set(
+                    gating=TopKDropFreeGating.default_config().set(
                         num_experts_per_token=num_experts_per_token,
                         train_capacity_factor=0,
-                        eval_capacity_factor=float(num_experts),
                     ),
                 )
 
