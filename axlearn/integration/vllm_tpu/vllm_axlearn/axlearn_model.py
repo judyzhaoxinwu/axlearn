@@ -65,7 +65,7 @@ def _sanitize_partition_spec(spec, allowed_axes):
     return spec
 
 
-def _recursive_sanitize_specs(cfg, allowed_axes, mha_cls=None, gqa_cls=None):
+def _recursive_sanitize_specs(cfg, allowed_axes, mha_cls=None, gqa_cls=None, moe_cls=None):
     from axlearn.common.attention import GroupedQueryAttention, TransformerAttentionLayer
     from axlearn.common.config import ConfigBase
     from axlearn.common.repeat import Repeat
@@ -77,6 +77,11 @@ def _recursive_sanitize_specs(cfg, allowed_axes, mha_cls=None, gqa_cls=None):
             is_gqa = issubclass(cfg.attention.klass, GroupedQueryAttention)
             target_cls = gqa_cls if is_gqa else mha_cls
             cfg.attention.set(klass=target_cls)
+        if moe_cls and hasattr(cfg, "feed_forward") and hasattr(cfg.feed_forward, "klass"):
+            from axlearn.common.mixture_of_experts import TransformerFeedForwardDropFreeMoE
+
+            if issubclass(cfg.feed_forward.klass, TransformerFeedForwardDropFreeMoE):
+                cfg.feed_forward.set(klass=moe_cls)
         for key in cfg.keys():
             val = getattr(cfg, key)
             if isinstance(val, dict):
@@ -88,7 +93,7 @@ def _recursive_sanitize_specs(cfg, allowed_axes, mha_cls=None, gqa_cls=None):
                         new_dict[k] = _sanitize_partition_spec(v, allowed_axes)
                     else:
                         new_dict[k] = v
-                        _recursive_sanitize_specs(v, allowed_axes, mha_cls, gqa_cls)
+                        _recursive_sanitize_specs(v, allowed_axes, mha_cls, gqa_cls, moe_cls)
                 cfg.set(**{key: new_dict})
             elif isinstance(val, (list, tuple)):
                 from jax.sharding import PartitionSpec
@@ -99,10 +104,10 @@ def _recursive_sanitize_specs(cfg, allowed_axes, mha_cls=None, gqa_cls=None):
                         new_list.append(_sanitize_partition_spec(item, allowed_axes))
                     else:
                         new_list.append(item)
-                        _recursive_sanitize_specs(item, allowed_axes, mha_cls, gqa_cls)
+                        _recursive_sanitize_specs(item, allowed_axes, mha_cls, gqa_cls, moe_cls)
                 cfg.set(**{key: type(val)(new_list)})
             elif hasattr(val, "klass") or isinstance(val, ConfigBase):
-                _recursive_sanitize_specs(val, allowed_axes, mha_cls, gqa_cls)
+                _recursive_sanitize_specs(val, allowed_axes, mha_cls, gqa_cls, moe_cls)
             else:
                 from jax.sharding import PartitionSpec
 
@@ -310,6 +315,50 @@ class AxLearnForCausalLM(nnx.Module):
             class VllmGroupedQueryAttention(VllmAttentionMixin, GroupedQueryAttention):
                 pass
 
+            from tpu_inference.layers.common.fused_moe_gmm import fused_moe_func
+
+            from axlearn.common.mixture_of_experts import (
+                TopKDropFreeGating,
+                TransformerFeedForwardDropFreeMoE,
+            )
+
+            class VllmMoEMixin:
+                def _dispatch_and_combine(self, x: Tensor) -> Tensor:
+                    mesh = jax.sharding.get_abstract_mesh()
+                    orig_shape = x.shape
+                    x_flat = x.reshape(-1, orig_shape[-1])
+                    gating_output = jnp.matmul(
+                        x_flat.astype(jnp.float32), self.parameters["gate_weight"]
+                    )
+
+                    w1_0 = self.parameters["wi_0_weight"]
+                    w1_1 = self.parameters["wi_1_weight"]
+                    w13 = jnp.concatenate([w1_0, w1_1], axis=-1)
+                    w2 = self.parameters["wo_weight"]
+
+                    output = fused_moe_func(
+                        hidden_states=x_flat,
+                        w1=w13,
+                        w2=w2,
+                        w1_scale=None,
+                        w2_scale=None,
+                        w1_bias=None,
+                        w2_bias=None,
+                        gating_output=gating_output,
+                        topk=8,
+                        renormalize=True,
+                        mesh=mesh,
+                        use_ep=True,
+                        activation="silu",
+                        scoring_fn="softmax",
+                    )
+                    return output.reshape(orig_shape)
+
+            class VllmTransformerFeedForwardDropFreeMoE(
+                VllmMoEMixin, TransformerFeedForwardDropFreeMoE
+            ):
+                pass
+
         model_config_hf = vllm_config.model_config.hf_config
         if hasattr(model_config_hf, "thinker_config") and hasattr(
             model_config_hf.thinker_config, "text_config"
@@ -456,7 +505,7 @@ class AxLearnForCausalLM(nnx.Module):
                 )
                 from axlearn.common.utils import PartitionSpec
 
-                expert_cfg = TransformerFeedForwardDropFreeMoE.default_config().set(
+                expert_cfg = VllmTransformerFeedForwardDropFreeMoE.default_config().set(
                     num_experts=num_experts,
                     num_groups=1,
                     dim_to_mesh_axis_map={
@@ -526,6 +575,7 @@ class AxLearnForCausalLM(nnx.Module):
             allowed_axes,
             VllmMultiheadAttention,
             VllmGroupedQueryAttention,
+            VllmTransformerFeedForwardDropFreeMoE,
         )
         _recursive_set_block_size(self.axlearn_model_config)
 
