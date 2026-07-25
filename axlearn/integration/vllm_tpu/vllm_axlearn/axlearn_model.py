@@ -38,7 +38,7 @@ _vllm_context.layer_index = 0
 
 # Global flag to dynamically enable/disable the HuggingFace split-half RoPE monkey-patch
 # based on whether the loaded model's GCS checkpoint has its weights pre-permuted or not.
-_USE_SPLIT_HALF_ROPE = True
+_USE_SPLIT_HALF_ROPE = False
 _orig_apply_rotary_position_embeddings = None
 
 
@@ -324,7 +324,7 @@ class AxLearnForCausalLM(nnx.Module):
         # Since both the 0.6B and 30B checkpoints on GCS are now successfully converted
         # using the updated offline converter script (which permutes Q/K weights to interleaved format),
         # we set _USE_SPLIT_HALF_ROPE = False for all models. JAX will run native interleaved RoPE.
-        _USE_SPLIT_HALF_ROPE = True
+        _USE_SPLIT_HALF_ROPE = False
         logger.info(
             "=== [ROPE SWITCH] === All active GCS checkpoints are offline-permuted. Running 100% native AxLearn interleaved RoPE."
         )
@@ -419,7 +419,15 @@ class AxLearnForCausalLM(nnx.Module):
                 if isinstance(rope_params, dict):
                     rope_theta = rope_params.get("rope_theta", None)
             if rope_theta is None:
-                rope_theta = 10000.0
+                rope_theta = 1000000.0
+                logger.info(
+                    "=== [ROPE THETA DEBUG] === rope_theta was None in HF config! Falling back to default: "
+                    f"{rope_theta}"
+                )
+            else:
+                logger.info(
+                    f"=== [ROPE THETA DEBUG] === Extracted rope_theta from HF config: {rope_theta}"
+                )
 
             attention_qkv_linear.rope_pos_emb_layer.set(theta=float(rope_theta))
 
