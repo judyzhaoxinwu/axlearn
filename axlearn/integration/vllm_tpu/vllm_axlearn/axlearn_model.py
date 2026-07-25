@@ -461,8 +461,8 @@ class AxLearnForCausalLM(nnx.Module):
                     num_groups=1,
                     dim_to_mesh_axis_map={
                         "me": PartitionSpec(None, None),
-                        "emh": PartitionSpec("model", None, None),
-                        "ehm": PartitionSpec("model", None, None),
+                        "emh": PartitionSpec("expert", ("fsdp", "seq"), "model"),
+                        "ehm": PartitionSpec("expert", "model", ("fsdp", "seq")),
                         "ogsm": PartitionSpec("data", "expert", None, "model"),
                         "ogsec": PartitionSpec("data", "expert", None, None, None),
                         "oegcm": PartitionSpec("data", "expert", None, None, "model"),
