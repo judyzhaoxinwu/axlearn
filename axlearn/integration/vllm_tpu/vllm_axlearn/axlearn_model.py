@@ -35,6 +35,7 @@ _vllm_context = threading.local()
 _vllm_context.kv_caches = None
 _vllm_context.attention_metadata = None
 _vllm_context.layer_index = 0
+_vllm_context.mesh = None
 
 # Global flag to dynamically enable/disable the HuggingFace split-half RoPE monkey-patch
 # based on whether the loaded model's GCS checkpoint has its weights pre-permuted or not.
@@ -176,6 +177,7 @@ class AxLearnForCausalLM(nnx.Module):
         }
         axlearn_axis_names = tuple(vllm_axis_to_axlearn.get(name, name) for name in mesh.axis_names)
         self.mesh = jax.sharding.Mesh(mesh.devices, axlearn_axis_names)
+        _vllm_context.mesh = self.mesh
 
         # Register the remapped mesh globally in AxLearn's physical mesh fallback
         from axlearn.common.utils import thread_resources
@@ -324,7 +326,16 @@ class AxLearnForCausalLM(nnx.Module):
 
             class VllmMoEMixin:
                 def _dispatch_and_combine(self, x: Tensor) -> Tensor:
-                    mesh = jax.sharding.get_abstract_mesh()
+                    mesh = getattr(_vllm_context, "mesh", None)
+                    if (
+                        mesh is None
+                        or (hasattr(mesh, "empty") and mesh.empty)
+                        or not hasattr(mesh, "devices")
+                    ):
+                        from axlearn.common.utils import thread_resources
+
+                        mesh = thread_resources.env.physical_mesh
+
                     orig_shape = x.shape
                     x_flat = x.reshape(-1, orig_shape[-1])
                     gating_output = jnp.matmul(
@@ -631,6 +642,7 @@ class AxLearnForCausalLM(nnx.Module):
         _vllm_context.kv_caches = list(kv_caches)
         _vllm_context.attention_metadata = attention_metadata
         _vllm_context.layer_index = 0
+        _vllm_context.mesh = self.mesh
 
         input_ids_2d = jnp.expand_dims(input_ids, axis=1)
         pos = attention_metadata.input_positions
