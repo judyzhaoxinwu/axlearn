@@ -473,6 +473,7 @@ class AxLearnForCausalLM(nnx.Module):
                         num_experts_per_token=num_experts_per_token,
                         train_capacity_factor=0,
                     ),
+                    tiling=(128, 512, 512),
                 )
 
             from axlearn.common import decoder
