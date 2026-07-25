@@ -8,7 +8,7 @@ import jax
 import numpy as np
 import torch
 from absl import app, flags, logging
-from transformers import AutoModelForTextToWaveform
+from transformers import AutoModelForCausalLM, AutoModel
 
 from axlearn.common.checkpointer import TensorStoreStateStorage
 from axlearn.experiments.text.gpt import qwen
@@ -28,14 +28,42 @@ flags.DEFINE_string(
 )
 
 
+def permute_q_k_for_rope_numpy(vector: np.ndarray) -> np.ndarray:
+    """Permutes Q and K vectors from HuggingFace split-half layout to AxLearn interleaved layout.
+    
+    Args:
+        vector: A numpy array of shape [num_heads, head_dim, hidden_dim].
+    Returns:
+        A numpy array of the same shape with the head_dim axis interleaved.
+    """
+    n, h, d = vector.shape
+    vector = vector.reshape(n, 2, h // 2, d).transpose(0, 2, 1, 3)
+    return vector.reshape(n, h, d)
+
+
 def validate_checkpoint(ckpt_dir: str):
     logging.info("Loading original Hugging Face PyTorch model for numerical validation...")
-    hf_model = AutoModelForTextToWaveform.from_pretrained(
-        FLAGS.model_id,
-        torch_dtype=torch.bfloat16,  # <--- Load in bfloat16 (OOM-safe 60GB footprint)
-        trust_remote_code=True,
-        device_map="cpu",
-    )
+    
+    # Try loading with AutoModelForCausalLM first (for text-only models like Qwen3-30B-Instruct-2507),
+    # and fall back to AutoModel (for multimodal models like Qwen3-Omni) if unrecognized.
+    try:
+        hf_model = AutoModelForCausalLM.from_pretrained(
+            FLAGS.model_id,
+            torch_dtype=torch.bfloat16,  # <--- Load in bfloat16 (OOM-safe 60GB footprint)
+            trust_remote_code=True,
+            device_map="cpu",
+        )
+    except ValueError:
+        hf_model = AutoModel.from_pretrained(
+            FLAGS.model_id,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+            device_map="cpu",
+        )
+
+    # Dynamically resolve the text model block (nested under .thinker for Omni speech models,
+    # or at the top level for standard text-only causal language models).
+    text_model = hf_model.thinker if hasattr(hf_model, "thinker") else hf_model
 
     logging.info("Restoring sharded JAX parameters from target checkpoint: %s", ckpt_dir)
 
@@ -79,6 +107,30 @@ def validate_checkpoint(ckpt_dir: str):
         lambda x: TensorSpec(shape=x.shape, dtype=x.dtype), {"model": empty_state_spec}
     )
 
+    # Remap empty_trainer_state from outer to inner to match the new checkpoint layout
+    def remap_outer_to_inner(d):
+        if hasattr(d, "items"):
+            new_dict = {}
+            for k, v in d.items():
+                new_dict[k] = remap_outer_to_inner(v)
+            scale_key = new_dict.pop("scale_key", None)
+            scale_query = new_dict.pop("scale_query", None)
+            if scale_key is not None or scale_query is not None:
+                if "i_proj" not in new_dict:
+                    new_dict["i_proj"] = {}
+                if scale_key is not None:
+                    new_dict["i_proj"]["scale_key"] = scale_key
+                if scale_query is not None:
+                    new_dict["i_proj"]["scale_query"] = scale_query
+            return new_dict
+        if isinstance(d, list):
+            return [remap_outer_to_inner(x) for x in d]
+        if isinstance(d, tuple):
+            return tuple(remap_outer_to_inner(x) for x in d)
+        return d
+
+    empty_trainer_state = remap_outer_to_inner(empty_trainer_state)
+
     # Restore sharded parameters dictionary from GCS natively using the structural template
     logging.info("Reading sharded parameters from GCS...")
     restored_state = storage.restore_from_dir(
@@ -94,7 +146,7 @@ def validate_checkpoint(ckpt_dir: str):
 
     # 1. Verify Embeddings (Slicing padded rows to base vocab_size, casting to float32 to avoid BFloat16 numpy exceptions)
     hf_emb = (
-        hf_model.thinker.model.embed_tokens.weight.detach()
+        text_model.model.embed_tokens.weight.detach()
         .cpu()
         .to(torch.float32)
         .numpy()[:vocab_size, :]
@@ -109,7 +161,7 @@ def validate_checkpoint(ckpt_dir: str):
 
     # 2. Verify LM Head (Saved without .T transposition, comparing sliced base shape, casting to float32)
     hf_head = (
-        hf_model.thinker.lm_head.weight.detach().cpu().to(torch.float32).numpy()[:vocab_size, :]
+        text_model.lm_head.weight.detach().cpu().to(torch.float32).numpy()[:vocab_size, :]
     )
     jax_head = jax_model_params["decoder"]["lm_head"]["weight"]
     assert (
@@ -120,7 +172,7 @@ def validate_checkpoint(ckpt_dir: str):
     assert head_diff < 1e-5, f"LM Head numerical discrepancy exceeded threshold: {head_diff}"
 
     # 3. Verify Layer 1 attention projections (4D layouts mapping)
-    first_layer = hf_model.thinker.model.layers[0]
+    first_layer = text_model.model.layers[0]
     hidden_dim = first_layer.input_layernorm.weight.shape[0]
 
     # Retrieve restored attention qkv weights (which are 4D [hidden_dim, 40, 128])
@@ -134,7 +186,13 @@ def validate_checkpoint(ckpt_dir: str):
     q = q.reshape(32, 128, hidden_dim)
     k = k.reshape(4, 128, hidden_dim)
     v = v.reshape(4, 128, hidden_dim)
-    hf_qkv = np.concatenate([q, k, v], axis=0).transpose(
+    
+    # Permute the PyTorch Q and K weights to interleaved layout in the validation script
+    # to perfectly match our new, offline-permuted sharded TensorStore checkpoint!
+    q_permuted = permute_q_k_for_rope_numpy(q)
+    k_permuted = permute_q_k_for_rope_numpy(k)
+    
+    hf_qkv = np.concatenate([q_permuted, k_permuted, v], axis=0).transpose(
         2, 0, 1
     )  # Transpose to [hidden_dim, 40, 128]
 
@@ -145,7 +203,7 @@ def validate_checkpoint(ckpt_dir: str):
     logging.info("Layer 1 QKV absolute max difference: %e", qkv_diff)
     assert qkv_diff < 1e-5, f"QKV numerical discrepancy exceeded threshold: {qkv_diff}"
 
-    # Retrieve restored attention o_proj weights (which are 4D [hidden_dim, 32, 128])
+    # 4. Verify Layer 1 attention o_proj
     jax_o = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["self_attention"][
         "attention"
     ]["o_proj"]["weight"][0]
@@ -157,7 +215,30 @@ def validate_checkpoint(ckpt_dir: str):
     logging.info("Layer 1 O Proj absolute max difference: %e", o_diff)
     assert o_diff < 1e-5, f"O Proj numerical discrepancy exceeded threshold: {o_diff}"
 
-    # 5. Verify Layer 1 Sparse MoE parameters
+    # 5. Verify Layer 1 QK-Norm Scales (at their inner attention paths!)
+    jax_scale_query = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["self_attention"][
+        "attention"
+    ]["i_proj"]["scale_query"]["norm"]["scale"][0]
+    jax_scale_key = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["self_attention"][
+        "attention"
+    ]["i_proj"]["scale_key"]["norm"]["scale"][0]
+    
+    hf_scale_query = first_layer.self_attn.q_norm.weight.detach().cpu().to(torch.float32).numpy()
+    hf_scale_key = first_layer.self_attn.k_norm.weight.detach().cpu().to(torch.float32).numpy()
+    
+    assert hf_scale_query.shape == jax_scale_query.shape, f"Scale Query shape mismatch!"
+    assert hf_scale_key.shape == jax_scale_key.shape, f"Scale Key shape mismatch!"
+    
+    query_norm_diff = np.max(np.abs(hf_scale_query - jax_scale_query))
+    key_norm_diff = np.max(np.abs(hf_scale_key - jax_scale_key))
+    
+    logging.info("Layer 1 Scale Query absolute max difference: %e", query_norm_diff)
+    logging.info("Layer 1 Scale Key absolute max difference: %e", key_norm_diff)
+    
+    assert query_norm_diff < 1e-5, f"Scale Query discrepancy exceeded threshold!"
+    assert key_norm_diff < 1e-5, f"Scale Key discrepancy exceeded threshold!"
+
+    # 6. Verify Layer 1 Sparse MoE parameters
     jax_moe_gate = jax_model_params["decoder"]["transformer"]["repeat"]["layer"]["feed_forward"][
         "gate_weight"
     ][0]
@@ -170,7 +251,7 @@ def validate_checkpoint(ckpt_dir: str):
     assert gate_diff < 1e-5, f"MoE Gate numerical discrepancy exceeded threshold: {gate_diff}"
 
     logging.info("\n==============================================================")
-    logging.info("VALIDATION SUCCESSFUL: Checkpoint is 100% numerically identical to Hugging Face!")
+    logging.info("VALIDATION SUCCESSFUL: Converted JAX checkpoint is 100% mathematically aligned and verified!")
     logging.info("==============================================================")
 
 

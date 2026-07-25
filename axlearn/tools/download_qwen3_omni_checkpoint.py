@@ -1,6 +1,8 @@
 # Copyright © 2026 Apple Inc.
 
+
 """Utility script serializing Qwen MoE checkpoints into sharded JAX TensorStore arrays cleanly, fully aligned with JAX specs shapes."""
+
 
 import _thread
 import contextvars
@@ -11,331 +13,367 @@ import select
 import threading
 import time
 
+
 import jax
 import numpy as np
 import tensorflow as tf
 import torch
 from absl import app, flags, logging
+import json
 from huggingface_hub import snapshot_download
-from transformers import AutoModelForTextToWaveform
+from safetensors.torch import safe_open
 
-from axlearn.common.checkpointer import TensorStoreStateStorage
+
+from axlearn.common import utils
+from axlearn.common.checkpointer import TensorStoreStateStorage, write_index_file
+from axlearn.common.utils import TensorSpec
 from axlearn.experiments.text.gpt import qwen
+import jax.numpy as jnp
+from jax.experimental.array_serialization import serialization
+import tensorstore as ts
+
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
-    "model_id",
-    "Qwen/Qwen3-Omni-30B-A3B-Instruct",
-    "Hugging Face model identifier repo path",
-    required=False,
+   "model_id",
+   "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+   "Hugging Face model identifier repo path",
+   required=False,
 )
 flags.DEFINE_string(
-    "output_dir",
-    None,
-    "Destination GCS Bucket path or local folder for JAX checkpoints",
-    required=True,
+   "output_dir",
+   None,
+   "Destination GCS Bucket path or local folder for JAX checkpoints",
+   required=True,
 )
+
+
+def permute_q_k_for_rope_numpy(vector: np.ndarray) -> np.ndarray:
+   """Permutes Q and K vectors from HuggingFace split-half layout to AxLearn interleaved layout.
+   
+   Args:
+       vector: A numpy array of shape [num_heads, head_dim, hidden_dim].
+   Returns:
+       A numpy array of the same shape with the head_dim axis interleaved.
+   """
+   n, h, d = vector.shape
+   vector = vector.reshape(n, 2, h // 2, d).transpose(0, 2, 1, 3)
+   return vector.reshape(n, h, d)
 
 
 def download_hf_model(model_id: str) -> str:
-    """Downloads PyTorch model checkpoints from Hugging Face Hub."""
-    logging.info("Downloading Hugging Face model: %s", model_id)
-    local_dir = snapshot_download(
-        repo_id=model_id,
-        ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
-    )
-    logging.info("Model successfully downloaded locally to: %s", local_dir)
-    return local_dir
-
-
-def extract_numpy_weights(hf_model) -> dict:
-    """Extracts all PyTorch weights directly into contiguous pre-allocated NumPy arrays fully matching JAX 4D shapes."""
-    num_layers = len(hf_model.thinker.model.layers)
-    logging.info("Pre-allocating contiguous NumPy arrays for %d layers...", num_layers)
-
-    # Extract dimensions dynamically from JAX config (Vocab size is exactly 151936 for Qwen3)
-    vocab_size = qwen.QWEN3_VOCAB_SIZE
-    first_layer = hf_model.thinker.model.layers[0]
-    hidden_dim = first_layer.input_layernorm.weight.shape[0]
-    num_experts = 128
-
-    gate_up_fused = first_layer.mlp.experts.gate_up_proj.detach().cpu().to(torch.float32).numpy()
-    intermediate_dim = gate_up_fused.shape[1] // 2
-
-    flat_params = {
-        "token_emb": hf_model.thinker.model.embed_tokens.weight.detach()
-        .cpu()
-        .to(torch.float32)
-        .numpy()[:vocab_size, :],  # Slice padded rows back to base 151936
-        "lm_head": hf_model.thinker.lm_head.weight.detach()
-        .cpu()
-        .to(torch.float32)
-        .numpy()[:vocab_size, :],  # Slice padded rows back to base 151936
-        "output_norm": hf_model.thinker.model.norm.weight.detach().cpu().to(torch.float32).numpy(),
-        # Pre-allocated contiguous JAX-aligned arrays
-        "input_norm": np.empty((num_layers, hidden_dim), dtype=np.float32),
-        "post_norm": np.empty((num_layers, hidden_dim), dtype=np.float32),
-        "qkv": np.empty(
-            (num_layers, hidden_dim, 40, 128), dtype=np.float32
-        ),  # 4D JAX shape [layers, hidden_dim, 40, 128]
-        "o": np.empty(
-            (num_layers, hidden_dim, 32, 128), dtype=np.float32
-        ),  # 4D JAX shape [layers, hidden_dim, 32, 128]
-        "scale_query": np.empty((num_layers, 128), dtype=np.float32),  # Attention RMSNorm scale
-        "scale_key": np.empty((num_layers, 128), dtype=np.float32),  # Attention RMSNorm scale
-        "moe_gate_weight": np.empty((num_layers, hidden_dim, num_experts), dtype=np.float32),
-        "moe_wi_0": np.empty(
-            (num_layers, num_experts, hidden_dim, intermediate_dim), dtype=np.float32
-        ),
-        "moe_wi_1": np.empty(
-            (num_layers, num_experts, hidden_dim, intermediate_dim), dtype=np.float32
-        ),
-        "moe_wo": np.empty(
-            (num_layers, num_experts, intermediate_dim, hidden_dim), dtype=np.float32
-        ),
-    }
-
-    # 2. Extract layers parameters sequentially directly into the pre-allocated slots
-    for i in range(num_layers):
-        layer = hf_model.thinker.model.layers[i]
-        logging.info(
-            "Extracting layer %d/%d directly into pre-allocated memory...", i + 1, num_layers
-        )
-
-        flat_params["input_norm"][i] = (
-            layer.input_layernorm.weight.detach().cpu().to(torch.float32).numpy()
-        )
-        flat_params["post_norm"][i] = (
-            layer.post_attention_layernorm.weight.detach().cpu().to(torch.float32).numpy()
-        )
-
-        # Attention projections GQA concatenation (Reshaping to 4D [hidden_dim, heads, head_dim] instead of flattening)
-        q = layer.self_attn.q_proj.weight.detach().cpu().to(torch.float32).numpy()  # [4096, 2048]
-        k = layer.self_attn.k_proj.weight.detach().cpu().to(torch.float32).numpy()  # [512, 2048]
-        v = layer.self_attn.v_proj.weight.detach().cpu().to(torch.float32).numpy()  # [512, 2048]
-
-        q = q.reshape(32, 128, hidden_dim)
-        k = k.reshape(4, 128, hidden_dim)
-        v = v.reshape(4, 128, hidden_dim)
-
-        qkv_layer = np.concatenate([q, k, v], axis=0)  # shape [40, 128, 2048]
-        flat_params["qkv"][i] = qkv_layer.transpose(2, 0, 1)  # Transpose to [2048, 40, 128]
-
-        # Extract o_proj.weight and reshape to [hidden_dim, 32, 128]
-        o = layer.self_attn.o_proj.weight.detach().cpu().to(torch.float32).numpy()  # [2048, 4096]
-        flat_params["o"][i] = o.reshape(hidden_dim, 32, 128)
-
-        # Extract Attention Query/Key RMSNorm scales
-        flat_params["scale_query"][i] = (
-            layer.self_attn.q_norm.weight.detach().cpu().to(torch.float32).numpy()
-        )
-        flat_params["scale_key"][i] = (
-            layer.self_attn.k_norm.weight.detach().cpu().to(torch.float32).numpy()
-        )
-
-        # Sparse MoE parameters extraction
-        if hasattr(layer, "mlp"):
-            flat_params["moe_gate_weight"][i] = (
-                layer.mlp.gate.weight.detach().cpu().to(torch.float32).numpy().T
-            )
-
-            gate_up_fused = layer.mlp.experts.gate_up_proj.detach().cpu().to(torch.float32).numpy()
-            gate_up = gate_up_fused.reshape(num_experts, 2, intermediate_dim, hidden_dim)
-
-            flat_params["moe_wi_0"][i] = gate_up[:, 0, :, :].transpose(0, 2, 1)
-            flat_params["moe_wi_1"][i] = gate_up[:, 1, :, :].transpose(0, 2, 1)
-
-            down_fused = layer.mlp.experts.down_proj.detach().cpu().to(torch.float32).numpy()
-            flat_params["moe_wo"][i] = down_fused.transpose(0, 2, 1)
-
-        # Free PyTorch layer memory immediately
-        hf_model.thinker.model.layers[i] = None
-        gc.collect()
-
-    return flat_params
-
-
-def populate_jax_state(flat_params: dict) -> dict:
-    """Structures the pre-allocated NumPy arrays directly into JAX Arrays using progressive sequential memory collection."""
-    logging.info("Structuring JAX parameter tree natively with pre-allocated JAX Arrays...")
-    import jax.numpy as jnp
-
-    # Initialize JAX parameter variables sequentially, executing gc.collect() after each major pop
-    emb_weight = jnp.array(flat_params.pop("token_emb"))
-    gc.collect()
-
-    lm_head_weight = jnp.array(flat_params.pop("lm_head"))
-    gc.collect()
-
-    output_norm_scale = jnp.array(flat_params.pop("output_norm"))
-    gc.collect()
-
-    input_norm_scale = jnp.array(flat_params.pop("input_norm"))
-    gc.collect()
-
-    qkv_weight = jnp.array(flat_params.pop("qkv"))
-    gc.collect()
-
-    o_weight = jnp.array(flat_params.pop("o"))
-    gc.collect()
-
-    scale_query_scale = jnp.array(flat_params.pop("scale_query"))
-    gc.collect()
-
-    scale_key_scale = jnp.array(flat_params.pop("scale_key"))
-    gc.collect()
-
-    post_norm_scale = jnp.array(flat_params.pop("post_norm"))
-    gc.collect()
-
-    gate_weight = jnp.array(flat_params.pop("moe_gate_weight"))
-    gc.collect()
-
-    wi_0_weight = jnp.array(flat_params.pop("moe_wi_0"))
-    gc.collect()
-
-    wi_1_weight = jnp.array(flat_params.pop("moe_wi_1"))
-    gc.collect()
-
-    wo_weight = jnp.array(flat_params.pop("moe_wo"))
-    gc.collect()
-
-    # Reconstruct the exact nested JAX parameters dictionary expected by SpmdTrainer natively
-    jax_params = {
-        "decoder": {
-            "emb": {"token_emb": {"weight": emb_weight}},
-            "lm_head": {"weight": lm_head_weight},
-            "output_norm": {"scale": output_norm_scale},
-            "transformer": {
-                "repeat": {
-                    "layer": {
-                        "self_attention": {
-                            "norm": {"scale": input_norm_scale},
-                            "attention": {
-                                "i_proj": {"i_proj": {"qkv_proj": {"weight": qkv_weight}}},
-                                "o_proj": {"weight": o_weight},
-                                "scale_query": {"norm": {"scale": scale_query_scale}},
-                                "scale_key": {"norm": {"scale": scale_key_scale}},
-                            },
-                        },
-                        "feed_forward": {
-                            "norm": {"scale": post_norm_scale},
-                            "gate_weight": gate_weight,
-                            "wi_0_weight": wi_0_weight,
-                            "wi_1_weight": wi_1_weight,
-                            "wo_weight": wo_weight,
-                        },
-                    }
-                }
-            },
-        }
-    }
-    return jax_params
-
-
-def monitor_upload_progress(step_dir: str, total_expected_files: int, stop_event: threading.Event):
-    """Polls the GCS output folder recursively to count successfully written files."""
-    logging.info("Starting GCS upload progress monitor thread...")
-
-    while not stop_event.is_set():
-        try:
-            gda_dir = os.path.join(step_dir, "gda")
-            file_count = 0
-            if tf.io.gfile.exists(gda_dir):
-                for root, dirs, files in tf.io.gfile.walk(gda_dir):
-                    file_count += len(files)
-
-            percentage = (
-                (file_count / total_expected_files) * 100 if total_expected_files > 0 else 0
-            )
-            logging.info(
-                "Uploading weights to GCS... %d%% [%d/%d files written]",
-                int(percentage),
-                file_count,
-                total_expected_files,
-            )
-        except Exception:
-            pass
-        time.sleep(5)
+   """Downloads PyTorch model checkpoints from Hugging Face Hub."""
+   logging.info("Downloading Hugging Face model: %s", model_id)
+   local_dir = snapshot_download(
+       repo_id=model_id,
+       ignore_patterns=["*.msgpack", "*.h5", "*.ot"],
+   )
+   logging.info("Model successfully downloaded locally to: %s", local_dir)
+   return local_dir
 
 
 def convert_and_save(local_pytorch_dir: str, output_dir: str):
-    logging.info("Loading Hugging Face PyTorch Qwen Model...")
-    hf_model = AutoModelForTextToWaveform.from_pretrained(
-        local_pytorch_dir, torch_dtype=torch.bfloat16, trust_remote_code=True, device_map="cpu"
-    )
+   logging.info("Instantiating AXLearn model template for streaming conversion...")
+   qwen_kwargs = qwen.get_trainer_kwargs(
+       "30B-A3B",
+       vocab_size=qwen.QWEN3_VOCAB_SIZE,
+       batch_size=1024,
+       max_sequence_length=1024,
+   )
+   qwen_kwargs["model_cfg"].set(name="model")
+   qwen_model = qwen_kwargs["model_cfg"].instantiate(parent=None)
+   empty_state_spec = jax.eval_shape(
+       lambda: qwen_model.initialize_parameters_recursively(prng_key=jax.random.PRNGKey(0))
+   )
 
-    # --- Step 1: Pre-allocate and Extract contiguous weights ---
-    flat_params = extract_numpy_weights(hf_model)
+   # Remap empty_state_spec from outer to inner to match the target serving layout (RoFormerQKVLinear)
+   def remap_outer_to_inner(d):
+       if hasattr(d, "items"):
+           new_dict = {}
+           for k, v in d.items():
+               new_dict[k] = remap_outer_to_inner(v)
+           scale_key = new_dict.pop("scale_key", None)
+           scale_query = new_dict.pop("scale_query", None)
+           if scale_key is not None or scale_query is not None:
+               if "i_proj" not in new_dict:
+                   new_dict["i_proj"] = {}
+               if scale_key is not None:
+                   new_dict["i_proj"]["scale_key"] = scale_key
+               if scale_query is not None:
+                   new_dict["i_proj"]["scale_query"] = scale_query
+           return new_dict
+       if isinstance(d, list):
+           return [remap_outer_to_inner(x) for x in d]
+       if isinstance(d, tuple):
+           return tuple(remap_outer_to_inner(x) for x in d)
+       return d
 
-    logging.info("Deleting PyTorch model and clearing garbage collector...")
-    del hf_model
-    gc.collect()
+   empty_state_spec = remap_outer_to_inner(empty_state_spec)
 
-    # --- Step 2: Structure JAX parameters tree natively ---
-    jax_params = populate_jax_state(flat_params)
+   empty_trainer_state = jax.tree.map(
+       lambda x: TensorSpec(shape=x.shape, dtype=x.dtype), {"model": empty_state_spec}
+   )
 
-    logging.info("Purging intermediate flat parameters dictionary...")
-    del flat_params
-    gc.collect()
 
-    # --- Step 3: Serialize and Save ---
-    logging.info("Serializing sharded JAX parameters to GCS path...")
+   storage = TensorStoreStateStorage(TensorStoreStateStorage.default_config())
+   step_dir = os.path.join(output_dir, "step_00000000")
+   tf.io.gfile.makedirs(step_dir)
+   spec = storage._get_spec(step=0, state=empty_trainer_state, ckpt_dir=step_dir)
 
-    # Temporarily bypass deepcopy entirely during instantiation to avoid Python 3.12 C-level pickling crashes
-    _orig_deepcopy = copy.deepcopy
-    copy.deepcopy = lambda x, memo=None: x
-    try:
-        storage_cfg = TensorStoreStateStorage.default_config().set(max_concurrent_gb=16)
-        storage = TensorStoreStateStorage(storage_cfg)
-    finally:
-        # Restore original deepcopy immediately
-        copy.deepcopy = _orig_deepcopy
 
-    # Save the model state natively under step_00000000 folder
-    step_dir = os.path.join(output_dir, "step_00000000")
-    tf.io.gfile.makedirs(step_dir)
+   dirs = sorted(list(set(os.path.dirname(path) for path in spec.storage_paths)))
+   logging.info("Creating TensorStore directories on disk...")
+   for d in dirs:
+       tf.io.gfile.makedirs(d)
+   logging.info("Writing checkpointer index file...")
+   write_index_file(ckpt_dir=step_dir, index=spec.index)
 
-    # Mapped structure expected inside trainer_state
-    trainer_state = {"model": jax_params}
 
-    # Start progress monitoring thread in background (Dynamically count exact sharded JAX leaves!)
-    total_expected_files = len(jax.tree_util.tree_leaves(jax_params))
-    stop_event = threading.Event()
-    monitor_thread = threading.Thread(
-        target=monitor_upload_progress, args=(step_dir, total_expected_files, stop_event)
-    )
+   ts_specs = {}
+   for storage_path, ts_spec in zip(spec.storage_paths, spec.tensorstore_specs):
+       rel_path = storage_path.split("gda/model/")[1]
+       ts_specs[rel_path] = ts_spec
 
-    monitor_thread.daemon = True
-    monitor_thread.start()
 
-    try:
-        storage.save_to_dir(
-            step=0,
-            state=trainer_state,
-            ckpt_dir=step_dir,
-        )
+   param_specs = {}
+   for path, value in utils.flatten_items(empty_state_spec, separator="/"):
+       param_specs[path] = value
 
-        logging.info("Waiting for asynchronous GCS serialization threads to fully commit...")
-        storage._manager.wait_until_finished()  # <--- Force main thread to block until all 60GB are written!
-    finally:
-        stop_event.set()
-        monitor_thread.join(timeout=2)
 
-    logging.info("Checkpoints successfully sharded and saved to GCS.")
+   def open_ts(rel_path: str):
+       ts_spec = copy.deepcopy(ts_specs[rel_path])
+       spec_obj = param_specs[rel_path]
+       if "dtype" not in ts_spec:
+           ts_spec["dtype"] = jnp.dtype(spec_obj.dtype).name
+       if "metadata" not in ts_spec:
+           meta = serialization._get_metadata(spec_obj)
+           shape = list(spec_obj.shape)
+           if len(shape) == 4 and shape[0] == 48 and shape[1] == 128:
+               meta["chunks"] = [1, 1, shape[2], shape[3]]
+           elif len(shape) >= 2 and shape[0] == 48:
+               meta["chunks"] = [1] + shape[1:]
+           ts_spec["metadata"] = meta
+       return ts.open(
+           ts.Spec(ts_spec),
+           create=True,
+           open=True,
+           context=serialization.TS_CONTEXT,
+       ).result()
+
+
+   logging.info("Reading Hugging Face safetensors index...")
+   with open(
+       os.path.join(local_pytorch_dir, "model.safetensors.index.json"),
+       "r",
+       encoding="utf-8",
+   ) as f:
+       index_json = json.load(f)
+   weight_map = index_json["weight_map"]
+
+
+   prefix = ""
+   for k in weight_map:
+       if k.startswith("thinker."):
+           prefix = "thinker."
+           break
+
+
+   current_sf = {"name": None, "f": None}
+
+
+   def get_hf(hf_name: str):
+       full_name = f"{prefix}{hf_name}"
+       if full_name not in weight_map:
+           raise KeyError(f"Weight {full_name} not found in HF index weight map")
+       sf_name = weight_map[full_name]
+       if current_sf["name"] != sf_name:
+           if current_sf["f"] is not None:
+               current_sf["f"] = None
+               gc.collect()
+           sf_path = os.path.join(local_pytorch_dir, sf_name)
+           current_sf["name"] = sf_name
+           current_sf["f"] = safe_open(sf_path, framework="numpy", device="cpu")
+       return current_sf["f"].get_tensor(full_name)
+
+
+   vocab_size = qwen.QWEN3_VOCAB_SIZE
+
+
+   logging.info("Streaming Embeddings and LM Head to SSD...")
+   token_emb = get_hf("model.embed_tokens.weight")[:vocab_size, :].astype(
+       np.float32
+   )
+   open_ts("decoder/emb/token_emb/weight").write(token_emb).result()
+   del token_emb
+
+
+   lm_head = get_hf("lm_head.weight")[:vocab_size, :].astype(np.float32)
+   open_ts("decoder/lm_head/weight").write(lm_head).result()
+   del lm_head
+
+
+   output_norm = get_hf("model.norm.weight").astype(np.float32)
+   open_ts("decoder/output_norm/scale").write(output_norm).result()
+   del output_norm
+   gc.collect()
+
+
+   wi_0_shape = param_specs[
+       "decoder/transformer/repeat/layer/feed_forward/wi_0_weight"
+   ].shape
+   num_layers = wi_0_shape[0]
+   num_experts = wi_0_shape[1]
+   hidden_dim = wi_0_shape[2]
+   intermediate_dim = wi_0_shape[3]
+
+
+   logging.info("Opening multi-layer TensorStore streaming datasets...")
+   ts_input_norm = open_ts(
+       "decoder/transformer/repeat/layer/self_attention/norm/scale"
+   )
+   ts_post_norm = open_ts("decoder/transformer/repeat/layer/feed_forward/norm/scale")
+   ts_qkv = open_ts(
+       "decoder/transformer/repeat/layer/self_attention/attention/i_proj/i_proj/qkv_proj/weight"
+   )
+   ts_o = open_ts(
+       "decoder/transformer/repeat/layer/self_attention/attention/o_proj/weight"
+   )
+   
+   # Write QK-Norm scales directly to the inner i_proj paths to natively
+   # match our mathematically correct model execution structure (RoFormerQKVLinear).
+   ts_scale_query = open_ts(
+       "decoder/transformer/repeat/layer/self_attention/attention/i_proj/scale_query/norm/scale"
+   )
+   ts_scale_key = open_ts(
+       "decoder/transformer/repeat/layer/self_attention/attention/i_proj/scale_key/norm/scale"
+   )
+   
+   ts_moe_gate = open_ts(
+       "decoder/transformer/repeat/layer/feed_forward/gate_weight"
+   )
+   ts_wi_0 = open_ts("decoder/transformer/repeat/layer/feed_forward/wi_0_weight")
+   ts_wi_1 = open_ts("decoder/transformer/repeat/layer/feed_forward/wi_1_weight")
+   ts_wo = open_ts("decoder/transformer/repeat/layer/feed_forward/wo_weight")
+
+
+   is_module_list = (
+       f"{prefix}model.layers.0.mlp.experts.0.gate_proj.weight" in weight_map
+   )
+
+
+   logging.info("Streaming 48 transformer layers one by one directly to SSD...")
+   for i in range(num_layers):
+       logging.info("Streaming Layer %d/%d to TensorStore...", i + 1, num_layers)
+
+
+       ts_input_norm[i].write(
+           get_hf(f"model.layers.{i}.input_layernorm.weight").astype(np.float32)
+       ).result()
+       ts_post_norm[i].write(
+           get_hf(f"model.layers.{i}.post_attention_layernorm.weight").astype(
+               np.float32
+           )
+       ).result()
+
+
+       q = get_hf(f"model.layers.{i}.self_attn.q_proj.weight").astype(np.float32)
+       k = get_hf(f"model.layers.{i}.self_attn.k_proj.weight").astype(np.float32)
+       v = get_hf(f"model.layers.{i}.self_attn.v_proj.weight").astype(np.float32)
+
+
+       q = q.reshape(32, 128, hidden_dim)
+       k = k.reshape(4, 128, hidden_dim)
+       v = v.reshape(4, 128, hidden_dim)
+
+       # Permute Q and K weights from Hugging Face split-half RoPE format
+       # to AxLearn interleaved RoPE format before writing to the sharded TensorStore checkpoint.
+       q_permuted = permute_q_k_for_rope_numpy(q)
+       k_permuted = permute_q_k_for_rope_numpy(k)
+
+       qkv_layer = np.concatenate([q_permuted, k_permuted, v], axis=0)
+       ts_qkv[i].write(qkv_layer.transpose(2, 0, 1)).result()
+       del q, k, v, q_permuted, k_permuted, qkv_layer
+
+
+       o = get_hf(f"model.layers.{i}.self_attn.o_proj.weight").astype(np.float32)
+       ts_o[i].write(o.reshape(hidden_dim, 32, 128)).result()
+       del o
+
+
+       ts_scale_query[i].write(
+           get_hf(f"model.layers.{i}.self_attn.q_norm.weight").astype(np.float32)
+       ).result()
+       ts_scale_key[i].write(
+           get_hf(f"model.layers.{i}.self_attn.k_norm.weight").astype(np.float32)
+       ).result()
+
+
+       # MoE Experts
+       ts_moe_gate[i].write(
+           get_hf(f"model.layers.{i}.mlp.gate.weight").astype(np.float32).T
+       ).result()
+
+
+       if is_module_list:
+           for e in range(num_experts):
+               ts_wi_0[i, e].write(
+                   get_hf(f"model.layers.{i}.mlp.experts.{e}.gate_proj.weight")
+                   .astype(np.float32)
+                   .T
+               ).result()
+               ts_wi_1[i, e].write(
+                   get_hf(f"model.layers.{i}.mlp.experts.{e}.up_proj.weight")
+                   .astype(np.float32)
+                   .T
+               ).result()
+               ts_wo[i, e].write(
+                   get_hf(f"model.layers.{i}.mlp.experts.{e}.down_proj.weight")
+                   .astype(np.float32)
+                   .T
+               ).result()
+       else:
+           gate_up_fused = get_hf(
+               f"model.layers.{i}.mlp.experts.gate_up_proj.weight"
+           ).astype(np.float32)
+           gate_up = gate_up_fused.reshape(
+               num_experts, 2, intermediate_dim, hidden_dim
+           )
+
+
+           ts_wi_0[i].write(gate_up[:, 0, :, :].transpose(0, 2, 1)).result()
+           ts_wi_1[i].write(gate_up[:, 1, :, :].transpose(0, 2, 1)).result()
+
+
+           down_fused = get_hf(
+               f"model.layers.{i}.mlp.experts.down_proj.weight"
+           ).astype(np.float32)
+           ts_wo[i].write(down_fused.transpose(0, 2, 1)).result()
+           del gate_up_fused, gate_up, down_fused
+
+
+       gc.collect()
+
+
+   logging.info("Streaming conversion successfully completed!")
+   logging.info("Checkpoints successfully sharded and saved to GCS.")
+
+
 
 
 def main(_):
-    devices = np.array(jax.devices()).reshape(-1, 1)
-    mesh = jax.sharding.Mesh(
-        devices=devices,
-        axis_names=("data", "model"),
-    )
+   devices = np.array(jax.devices()).reshape(-1, 1)
+   mesh = jax.sharding.Mesh(
+       devices=devices,
+       axis_names=("data", "model"),
+   )
 
-    with mesh:
-        local_pytorch_dir = download_hf_model(FLAGS.model_id)
-        convert_and_save(local_pytorch_dir, FLAGS.output_dir)
+
+   with mesh:
+       local_pytorch_dir = download_hf_model(FLAGS.model_id)
+       convert_and_save(local_pytorch_dir, FLAGS.output_dir)
+
+
 
 
 if __name__ == "__main__":
-    app.run(main)
+   app.run(main)

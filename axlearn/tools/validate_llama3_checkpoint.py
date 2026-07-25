@@ -104,13 +104,21 @@ def validate_checkpoint(ckpt_dir: str, model_size: str):
 
     # 4. Verify LM Head (LLaMA-3 lm_head weight has shape [vocab_size, hidden_dim] natively, saved without transposing)
     hf_head = hf_model.lm_head.weight.detach().cpu().to(torch.float32).numpy()[:vocab_size, :]
-    jax_head = jax_model_params["decoder"]["lm_head"]["weight"]
-    assert (
-        hf_head.shape == jax_head.shape
-    ), f"LM Head shape mismatch! HF: {hf_head.shape}, JAX: {jax_head.shape}"
-    head_diff = np.max(np.abs(hf_head - jax_head))
-    logging.info("lm_head absolute max difference: %e", head_diff)
-    assert head_diff < 1e-5, f"LM Head numerical discrepancy exceeded threshold: {head_diff}"
+    if "lm_head" in jax_model_params["decoder"]:
+        jax_head = jax_model_params["decoder"]["lm_head"]["weight"]
+        assert (
+            hf_head.shape == jax_head.shape
+        ), f"LM Head shape mismatch! HF: {hf_head.shape}, JAX: {jax_head.shape}"
+        head_diff = np.max(np.abs(hf_head - jax_head))
+        logging.info("lm_head absolute max difference: %e", head_diff)
+        assert head_diff < 1e-5, f"LM Head numerical discrepancy exceeded threshold: {head_diff}"
+    else:
+        logging.info("lm_head is shared with token_emb in JAX, verifying against token_emb...")
+        hf_emb = (
+            hf_model.model.embed_tokens.weight.detach().cpu().to(torch.float32).numpy()[:vocab_size, :]
+        )
+        assert np.allclose(hf_head, hf_emb), "PyTorch embed_tokens and lm_head weights do not match!"
+        logging.info("lm_head sharing verified successfully!")
 
     # 5. Verify Layer 1 attention projections
     first_layer = hf_model.model.layers[0]
