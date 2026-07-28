@@ -270,11 +270,11 @@ class AxLearnForCausalLM(nnx.Module):
                     return_aux=None,
                     page_pool=None,
                 ):
-                    query_positions = (
-                        jnp.arange(query.shape[1])[None]
-                        if query_positions is None
-                        else query_positions
-                    )
+                    if query_positions is None:
+                        pos = _vllm_context.attention_metadata.input_positions
+                        if pos.ndim > 1:
+                            pos = pos[0]
+                        query_positions = jnp.expand_dims(pos, axis=1)
                     q_proj, k_proj, v_proj = self.i_proj(query, query_positions=query_positions)
 
                     kv_cache_array = _vllm_context.kv_caches[_vllm_context.layer_index]
