@@ -361,7 +361,17 @@ class AxLearnForCausalLM(nnx.Module):
                         w1_1 = jnp.pad(w1_1, ((0, 0), (0, 0), (0, pad_len)))
                         w2 = jnp.pad(w2, ((0, 0), (0, pad_len), (0, 0)))
 
-                    w13 = jnp.concatenate([w1_0, w1_1], axis=-1)
+                    use_ep = mesh.shape.get("expert", 1) > 1
+                    if not use_ep and mesh_model_size > 1:
+                        # tensor_parallel_gmm shards w13 across devices, then gmm_v2 locally splits it in half.
+                        # We must interleave them at the chunk size so each device gets [gate_chunk, up_chunk].
+                        chunk_size = target_inter_size // mesh_model_size
+                        w1_0_split = w1_0.reshape(w1_0.shape[:-1] + (mesh_model_size, chunk_size))
+                        w1_1_split = w1_1.reshape(w1_1.shape[:-1] + (mesh_model_size, chunk_size))
+                        w13 = jnp.concatenate([w1_0_split, w1_1_split], axis=-1)
+                        w13 = w13.reshape(w13.shape[:-2] + (-1,))
+                    else:
+                        w13 = jnp.concatenate([w1_0, w1_1], axis=-1)
 
                     output = fused_moe_func(
                         hidden_states=x_flat,
@@ -375,7 +385,7 @@ class AxLearnForCausalLM(nnx.Module):
                         topk=8,
                         renormalize=True,
                         mesh=mesh,
-                        use_ep=mesh.shape.get("expert", 1) > 1,
+                        use_ep=use_ep,
                         activation="silu",
                         scoring_fn="softmax",
                     )
