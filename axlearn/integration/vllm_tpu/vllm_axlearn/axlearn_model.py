@@ -344,8 +344,24 @@ class AxLearnForCausalLM(nnx.Module):
 
                     w1_0 = self.parameters["wi_0_weight"]
                     w1_1 = self.parameters["wi_1_weight"]
-                    w13 = jnp.concatenate([w1_0, w1_1], axis=-1)
                     w2 = self.parameters["wo_weight"]
+
+                    # Pad intermediate size to be a multiple of 128 * TP to avoid TPU Sparse Core crash
+                    # "size_n should be divisible by 2 * num_lanes when fuse_act is enabled"
+                    orig_inter_size = w1_0.shape[-1]
+                    mesh_model_size = mesh.shape.get("model", 1)
+                    target_inter_size = (
+                        (orig_inter_size + 128 * mesh_model_size - 1)
+                        // (128 * mesh_model_size)
+                        * (128 * mesh_model_size)
+                    )
+                    pad_len = target_inter_size - orig_inter_size
+                    if pad_len > 0:
+                        w1_0 = jnp.pad(w1_0, ((0, 0), (0, 0), (0, pad_len)))
+                        w1_1 = jnp.pad(w1_1, ((0, 0), (0, 0), (0, pad_len)))
+                        w2 = jnp.pad(w2, ((0, 0), (0, pad_len), (0, 0)))
+
+                    w13 = jnp.concatenate([w1_0, w1_1], axis=-1)
 
                     output = fused_moe_func(
                         hidden_states=x_flat,
