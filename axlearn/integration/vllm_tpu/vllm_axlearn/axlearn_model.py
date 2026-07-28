@@ -359,7 +359,7 @@ class AxLearnForCausalLM(nnx.Module):
                         topk=8,
                         renormalize=True,
                         mesh=mesh,
-                        use_ep=True,
+                        use_ep=mesh.shape.get("expert", 1) > 1,
                         activation="silu",
                         scoring_fn="softmax",
                     )
