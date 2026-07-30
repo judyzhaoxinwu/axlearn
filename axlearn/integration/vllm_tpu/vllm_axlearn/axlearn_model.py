@@ -274,7 +274,7 @@ class AxLearnForCausalLM(nnx.Module):
                         pos = _vllm_context.attention_metadata.input_positions
                         if pos.ndim > 1:
                             pos = pos[0]
-                        query_positions = jnp.expand_dims(pos, axis=1)
+                        query_positions = jnp.expand_dims(pos, axis=0)
                     q_proj, k_proj, v_proj = self.i_proj(query, query_positions=query_positions)
 
                     kv_cache_array = _vllm_context.kv_caches[_vllm_context.layer_index]
@@ -428,16 +428,6 @@ class AxLearnForCausalLM(nnx.Module):
         configs_map = {}
         configs_map.update(c4_configs())
         configs_map.update(pajama_configs())
-        try:
-            from axlearn.experiments.text.gpt.qwen import trainer_configs as qwen_configs
-
-            configs_map.update(
-                qwen_configs(
-                    train_input_source=lambda **kwargs: None, eval_input_sources=lambda **kwargs: {}
-                )
-            )
-        except ImportError:
-            logger.warning("Could not import qwen configs from axlearn.")
         use_registry = bool(model_name and model_name in configs_map)
 
         if use_registry:
