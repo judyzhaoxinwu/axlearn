@@ -280,8 +280,14 @@ class AxLearnForCausalLM(nnx.Module):
                     kv_cache_array = _vllm_context.kv_caches[_vllm_context.layer_index]
                     md = _vllm_context.attention_metadata
 
-                    import jax
+                    import sys
+
                     from tpu_inference.layers.common.attention_interface import attention
+
+                    print(
+                        f"DEBUG: query shape = {query.shape}, query_positions shape = {query_positions.shape}",
+                        file=sys.stderr,
+                    )
 
                     mesh = jax.sharding.get_abstract_mesh()
                     q_proj_3d = jnp.squeeze(q_proj, axis=1)
@@ -406,24 +412,21 @@ class AxLearnForCausalLM(nnx.Module):
 
         logger.info(f"=== [HF CONFIG DEBUG] ===\n{model_config_hf}\n=========================")
 
+        axlearn_cfg = getattr(vllm_config, "additional_config", {}).get("axlearn_config", {})
+        model_name = axlearn_cfg.get("model_name", None)
+
         global _USE_SPLIT_HALF_ROPE
-        # Since both the 0.6B and 30B checkpoints on GCS are now successfully converted
-        # using the updated offline converter script (which permutes Q/K weights to interleaved format),
-        # we set _USE_SPLIT_HALF_ROPE = False for all models. JAX will run native interleaved RoPE.
-        _USE_SPLIT_HALF_ROPE = False
-        logger.info(
-            "=== [ROPE SWITCH] === All active GCS checkpoints are offline-permuted. Running 100% native AxLearn interleaved RoPE."
-        )
+        # Some Qwen models might not be permuted to interleaved yet.
+        _USE_SPLIT_HALF_ROPE = bool(model_name and "qwen" in model_name.lower())
+        logger.info(f"=== [ROPE SWITCH] === Set _USE_SPLIT_HALF_ROPE = {_USE_SPLIT_HALF_ROPE}")
 
         self.hidden_dim = getattr(
             model_config_hf, "hidden_size", getattr(model_config_hf, "hidden_dim", None)
         )
-        axlearn_cfg = getattr(vllm_config, "additional_config", {}).get("axlearn_config", {})
         hf_vocab = getattr(model_config_hf, "vocab_size", None)
         if hf_vocab == 152064:
             hf_vocab = 151936
         self.vocab_size = axlearn_cfg.get("vocab_size", hf_vocab)
-        model_name = axlearn_cfg.get("model_name", None)
 
         configs_map = {}
         configs_map.update(c4_configs())
