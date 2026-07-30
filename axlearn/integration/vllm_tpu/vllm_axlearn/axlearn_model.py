@@ -274,7 +274,7 @@ class AxLearnForCausalLM(nnx.Module):
                         pos = _vllm_context.attention_metadata.input_positions
                         if pos.ndim > 1:
                             pos = pos[0]
-                        query_positions = jnp.expand_dims(pos, axis=0)
+                        query_positions = jnp.expand_dims(pos, axis=1)
                     q_proj, k_proj, v_proj = self.i_proj(query, query_positions=query_positions)
 
                     kv_cache_array = _vllm_context.kv_caches[_vllm_context.layer_index]
@@ -516,8 +516,11 @@ class AxLearnForCausalLM(nnx.Module):
 
             # Both dense (0.6B) and MoE (30B) Qwen checkpoints on GCS are now successfully aligned
             # to the inner layout (i_proj/scale_query), matching the JAX serving structure natively.
-            # No serving-time remapping is needed for either model!
-            self._qk_norm_remap_mode = None
+            # However, HF fallback uses outer layout, so we need inner_to_outer for qwen.
+            if model_name and "qwen" in model_name.lower():
+                self._qk_norm_remap_mode = "inner_to_outer"
+            else:
+                self._qk_norm_remap_mode = None
             ffn_layer_types = None
             expert_cfg = None
             if num_experts is not None:
