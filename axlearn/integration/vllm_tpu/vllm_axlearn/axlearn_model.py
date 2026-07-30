@@ -446,6 +446,8 @@ class AxLearnForCausalLM(nnx.Module):
             )
             trainer_cfg = configs_map[model_name]()
             self.axlearn_model_config = trainer_cfg.model.set(name=model_name)
+            if "qwen" in model_name.lower():
+                self._qk_norm_remap_mode = "inner_to_outer"
         else:
             logger.info(
                 f"Named config '{model_name}' not found in AxLearn registry. Mapping properties model-agnostically from HF config."
