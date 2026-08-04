@@ -433,7 +433,16 @@ class AxLearnForCausalLM(nnx.Module):
         configs_map = {}
         configs_map.update(c4_configs())
         configs_map.update(pajama_configs())
-        use_registry = bool(model_name and model_name in configs_map)
+        use_registry = False
+        if model_name and model_name in configs_map:
+            # We bypass the AxLearn registry configs map for Qwen models
+            # to force model-agnostic mapping from the Hugging Face config.
+            if "qwen" in model_name.lower():
+                logger.info(
+                    f"Bypassing AxLearn registry for Qwen model '{model_name}' to map model-agnostically from HF config."
+                )
+            else:
+                use_registry = True
 
         if use_registry:
             logger.info(
@@ -441,8 +450,6 @@ class AxLearnForCausalLM(nnx.Module):
             )
             trainer_cfg = configs_map[model_name]()
             self.axlearn_model_config = trainer_cfg.model.set(name=model_name)
-            if "qwen" in model_name.lower():
-                self._qk_norm_remap_mode = "inner_to_outer"
         else:
             logger.info(
                 f"Named config '{model_name}' not found in AxLearn registry. Mapping properties model-agnostically from HF config."
@@ -521,11 +528,8 @@ class AxLearnForCausalLM(nnx.Module):
 
             # Both dense (0.6B) and MoE (30B) Qwen checkpoints on GCS are now successfully aligned
             # to the inner layout (i_proj/scale_query), matching the JAX serving structure natively.
-            # However, HF fallback uses outer layout, so we need inner_to_outer for qwen.
-            if model_name and "qwen" in model_name.lower():
-                self._qk_norm_remap_mode = "inner_to_outer"
-            else:
-                self._qk_norm_remap_mode = None
+            # No serving-time remapping is needed for either model!
+            self._qk_norm_remap_mode = None
             ffn_layer_types = None
             expert_cfg = None
             if num_experts is not None:
