@@ -416,8 +416,10 @@ class AxLearnForCausalLM(nnx.Module):
         model_name = axlearn_cfg.get("model_name", None)
 
         global _USE_SPLIT_HALF_ROPE
-        # Revert back to handling HF's split-half layout for Qwen
-        _USE_SPLIT_HALF_ROPE = bool(model_name and "qwen" in model_name.lower())
+        # The Qwen checkpoints on GCS are already successfully converted
+        # using the updated offline converter script (which permutes Q/K weights to interleaved format).
+        # We must set _USE_SPLIT_HALF_ROPE = False for all models. JAX will run native interleaved RoPE.
+        _USE_SPLIT_HALF_ROPE = False
         logger.info(f"=== [ROPE SWITCH] === Set _USE_SPLIT_HALF_ROPE = {_USE_SPLIT_HALF_ROPE}")
 
         self.hidden_dim = getattr(
