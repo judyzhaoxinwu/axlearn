@@ -484,7 +484,7 @@ class AxLearnForCausalLM(nnx.Module):
             # Configure QK-Norm scales on the inner projection layer (RoFormerQKVLinear)
             # so they execute BEFORE RoPE, matching the mathematically correct order of operations.
             model_type = getattr(model_config_hf, "model_type", "").lower()
-            qk_layernorm = getattr(model_config_hf, "qk_layernorm", False)
+            qk_layernorm = getattr(model_config_hf, "qk_layernorm", False) or "qwen3" in model_type
 
             attention_qkv_linear = RoFormerQKVLinear.default_config().set(
                 input_linear=atten_input_linear,
