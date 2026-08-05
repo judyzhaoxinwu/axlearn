@@ -39,7 +39,7 @@ _vllm_context.mesh = None
 
 # Global flag to dynamically enable/disable the HuggingFace split-half RoPE monkey-patch
 # based on whether the loaded model's GCS checkpoint has its weights pre-permuted or not.
-_USE_SPLIT_HALF_ROPE = False
+_USE_SPLIT_HALF_ROPE = True
 _orig_apply_rotary_position_embeddings = None
 
 
@@ -418,8 +418,8 @@ class AxLearnForCausalLM(nnx.Module):
         global _USE_SPLIT_HALF_ROPE
         # The Qwen checkpoints on GCS are already successfully converted
         # using the updated offline converter script (which permutes Q/K weights to interleaved format).
-        # We must set _USE_SPLIT_HALF_ROPE = False for all models. JAX will run native interleaved RoPE.
-        _USE_SPLIT_HALF_ROPE = False
+        # We must set _USE_SPLIT_HALF_ROPE = True for all models. JAX will run native interleaved RoPE.
+        _USE_SPLIT_HALF_ROPE = True
         logger.info(f"=== [ROPE SWITCH] === Set _USE_SPLIT_HALF_ROPE = {_USE_SPLIT_HALF_ROPE}")
 
         self.hidden_dim = getattr(
